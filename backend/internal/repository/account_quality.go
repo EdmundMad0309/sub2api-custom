@@ -1,0 +1,511 @@
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/lib/pq"
+)
+
+// 5 系（gpt-5.x）判定的两级状态（series_split 动作）：
+//   - 判定连败达到 fail_streak 次：把 6 系模型从该账号的目标分组白名单移除
+//   - 已处于「6 系已摘」状态时，任意一次通过：把 6 系模型加回来（恢复正常）
+const qualityActionSeriesRestored = "series_split_restored"
+
+func (r *scheduledTestPlanRepository) ListQualityPlans(ctx context.Context) ([]*service.ScheduledTestPlan, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT p.id, p.account_id, p.model_id, p.cron_expression, p.enabled, p.max_results, p.auto_recover, p.last_run_at, p.next_run_at, p.created_at, p.updated_at, p.pelican_config, p.running_until, a.name
+ FROM scheduled_test_plans p JOIN accounts a ON a.id=p.account_id
+ WHERE p.pelican_config->'quality' IS NOT NULL AND a.deleted_at IS NULL ORDER BY p.id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanPlans(rows, true)
+}
+func (r *scheduledTestPlanRepository) TriggerQuality(ctx context.Context, id int64) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE scheduled_test_plans SET next_run_at=NOW(), updated_at=NOW()
+ WHERE id=$1 AND enabled AND pelican_config->'quality' IS NOT NULL AND (running_until IS NULL OR running_until<NOW())`, id)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("plan must be enabled and idle")
+	}
+	return nil
+}
+
+type qualityGroup struct {
+	AccountID     int64           `json:"account_id"`
+	GroupID       int64           `json:"group_id"`
+	Priority      int             `json:"priority"`
+	CreatedAt     time.Time       `json:"created_at"`
+	AllowedModels json.RawMessage `json:"allowed_models"`
+}
+type qualityState struct {
+	Action         string          `json:"action"`
+	AccountVersion time.Time       `json:"account_version"`
+	Removed        []qualityGroup  `json:"removed"`
+	Remaining      json.RawMessage `json:"remaining"`
+	// PrevExcelBPS 记录本规则打开 Excel 模式之前该账号的 openai_excel_bps 取值
+	// （""、"true"、"false"），判定通过后据此恢复，避免覆盖运营手动设置。
+	PrevExcelBPS string `json:"prev_excel_bps,omitempty"`
+}
+
+// qualitySeriesSplitModels 返回账号在指定分组里的模型全集，并按 6 系 / 非 6 系拆分。
+// 优先用分组模型白名单，没有则退回账号 model_mapping；6 系统一按 gpt-6 前缀判定。
+func qualitySeriesSplitModels(ctx context.Context, tx *sql.Tx, accountID, groupID int64) (six []string, other []string, err error) {
+	var allowlist []byte
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(model_allowlist->'models','[]'::jsonb) FROM groups WHERE id=$1`, groupID).Scan(&allowlist); err != nil && err != sql.ErrNoRows {
+		return nil, nil, err
+	}
+	models := []string{}
+	// 优先使用账号自己的 model_mapping：它代表这个账号实际能服务的模型，
+	// 分组白名单常常不完整（例如漏掉 gpt-6-sol / gpt-6-luna），只作兜底。
+	var mapping []byte
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(credentials->'model_mapping','{}'::jsonb) FROM accounts WHERE id=$1`, accountID).Scan(&mapping); err != nil {
+		return nil, nil, err
+	}
+	raw := map[string]any{}
+	if len(mapping) > 0 {
+		_ = json.Unmarshal(mapping, &raw)
+	}
+	for key := range raw {
+		trimmed := strings.TrimSpace(key)
+		if trimmed != "" {
+			models = append(models, trimmed)
+		}
+	}
+	if len(models) == 0 {
+		if len(allowlist) > 0 {
+			_ = json.Unmarshal(allowlist, &models)
+		}
+	}
+	sort.Strings(models)
+	seen := map[string]bool{}
+	for _, model := range models {
+		trimmed := strings.TrimSpace(model)
+		if trimmed == "" || seen[strings.ToLower(trimmed)] {
+			continue
+		}
+		seen[strings.ToLower(trimmed)] = true
+		if strings.HasPrefix(strings.ToLower(trimmed), "gpt-6") {
+			six = append(six, trimmed)
+		} else {
+			other = append(other, trimmed)
+		}
+	}
+	return six, other, nil
+}
+
+// Lease/version checks, account mutation, ownership and scheduler invalidation
+// commit together. A paused, edited, deleted or expired run cannot change accounts.
+func (r *scheduledTestPlanRepository) ApplyQualityOutcome(ctx context.Context, plan *service.ScheduledTestPlan, until time.Time, outcome string) (string, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var valid bool
+	err = tx.QueryRowContext(ctx, `SELECT enabled AND updated_at=$2 AND running_until=$3 AND running_until>NOW()
+ FROM scheduled_test_plans WHERE id=$1 FOR UPDATE`, plan.ID, plan.UpdatedAt, until).Scan(&valid)
+	if err == sql.ErrNoRows || (err == nil && !valid) {
+		return "stale_run", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var version time.Time
+	var schedulable bool
+	var status string
+	err = tx.QueryRowContext(ctx, `SELECT updated_at, schedulable, status FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, plan.AccountID).Scan(&version, &schedulable, &status)
+	if err == sql.ErrNoRows {
+		return "account_deleted", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var raw []byte
+	err = tx.QueryRowContext(ctx, `SELECT state FROM account_quality_states WHERE plan_id=$1`, plan.ID).Scan(&raw)
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+	var state qualityState
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &state); err != nil {
+			return "", err
+		}
+	}
+	groups, err := qualityGroups(ctx, tx, plan.AccountID)
+	if err != nil {
+		return "", err
+	}
+	q := plan.PelicanConfig.Quality
+	action := "no_change"
+	changed := false
+	// 判定防抖：series_split 只有在「连续 N 次同一结论」时才动手，
+	// 单次答错不再立刻摘 6 系、单次答对也不再立刻升级，避免白名单反复横跳。
+	if q != nil && q.Action == "series_split" && (outcome == "failed" || outcome == "passed") {
+		// 已处于「6 系已摘」状态的账号：判定通过一次立即把 6 系加回来，不受 pass_streak 防抖约束
+		// （失败方向仍按 fail_streak 连败计数，避免一次抖动就摘 6 系）。
+		restoreFromDegraded := outcome == "passed" && state.Action == "series_split"
+		if !restoreFromDegraded {
+			required := q.FailStreak
+			if outcome == "passed" {
+				required = q.PassStreak
+			}
+			if required <= 0 {
+				required = 2
+			}
+			streak, streakErr := qualityOutcomeStreak(ctx, tx, plan.ID, outcome, required)
+			if streakErr != nil {
+				return "", streakErr
+			}
+			if streak < required {
+				return fmt.Sprintf("debounced_%s_%d_of_%d", outcome, streak, required), nil
+			}
+		}
+	}
+	switch {
+	case outcome == "inconclusive":
+		action = "inconclusive"
+	case outcome == "failed" && q.Action == "record_only":
+		// 仅记录模式：不修改分组与调度，也不进入隔离状态，只登记本轮失败结果。
+		action = "recorded_only"
+	case outcome == "failed" && q.Action == "excel_mode":
+		// 判定失败：打开 Excel(BPS) 模式，6 系白名单与其它配置保持不动。
+		// 作用域缺省时补 ["gpt-6-astra"]（与现有 Excel 号一致），已有作用域不覆盖。
+		var prev string
+		if err = tx.QueryRowContext(ctx, `SELECT COALESCE(extra->>'openai_excel_bps','') FROM accounts WHERE id=$1`, plan.AccountID).Scan(&prev); err != nil {
+			return "", err
+		}
+		// 已处于本规则开启的 Excel 模式：不重复写库，只记录保持状态。
+		if prev == "true" && state.Action == "excel_mode" {
+			action = "excel_mode_kept"
+			break
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET extra = jsonb_set(
+			CASE WHEN extra ? 'openai_excel_bps_models' THEN extra
+			     ELSE jsonb_set(extra, '{openai_excel_bps_models}', '["gpt-6-astra"]'::jsonb, true) END,
+			'{openai_excel_bps}', 'true'::jsonb, true), updated_at=clock_timestamp() WHERE id=$1`, plan.AccountID); err != nil {
+			return "", err
+		}
+		state.Action = "excel_mode"
+		state.PrevExcelBPS = prev
+		data, marshalErr := json.Marshal(state)
+		if marshalErr != nil {
+			return "", marshalErr
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO account_quality_states(plan_id,state) VALUES($1,$2) ON CONFLICT (plan_id) DO UPDATE SET state=EXCLUDED.state`, plan.ID, string(data)); err != nil {
+			return "", err
+		}
+		changed = true
+		action = "excel_mode_enabled"
+	case outcome == "failed" && state.Action != "":
+		action = "already_quarantined"
+	case outcome == "failed":
+		state.Action = q.Action
+		switch q.Action {
+		case "disable_scheduling":
+			if schedulable {
+				_, err = tx.ExecContext(ctx, `UPDATE accounts SET schedulable=false, updated_at=clock_timestamp() WHERE id=$1`, plan.AccountID)
+				changed = true
+				action = "scheduling_disabled"
+			}
+		case "remove_groups":
+			var all []qualityGroup
+			if err = json.Unmarshal(groups, &all); err != nil {
+				return "", err
+			}
+			selected := map[int64]bool{}
+			for _, id := range q.RemoveGroupIDs {
+				selected[id] = true
+			}
+			for _, group := range all {
+				if selected[group.GroupID] {
+					if _, err = tx.ExecContext(ctx, `DELETE FROM account_groups WHERE account_id=$1 AND group_id=$2`, plan.AccountID, group.GroupID); err != nil {
+						return "", err
+					}
+					state.Removed = append(state.Removed, group)
+				}
+			}
+			changed = len(state.Removed) > 0
+			if changed {
+				action = "groups_removed"
+				_, err = tx.ExecContext(ctx, `UPDATE accounts SET updated_at=clock_timestamp() WHERE id=$1`, plan.AccountID)
+			}
+		case "series_split":
+			// 答错：把 6 系模型从该账号的目标分组白名单里去掉，只留 5 系及其它模型。
+			var all []qualityGroup
+			if err = json.Unmarshal(groups, &all); err != nil {
+				return "", err
+			}
+			selected := map[int64]bool{}
+			for _, id := range q.RemoveGroupIDs {
+				selected[id] = true
+			}
+			applyAll := len(selected) == 0
+			for _, group := range all {
+				if !applyAll && !selected[group.GroupID] {
+					continue
+				}
+				_, other, splitErr := qualitySeriesSplitModels(ctx, tx, plan.AccountID, group.GroupID)
+				if splitErr != nil {
+					return "", splitErr
+				}
+				if len(other) == 0 {
+					continue
+				}
+				payload, marshalErr := json.Marshal(other)
+				if marshalErr != nil {
+					return "", marshalErr
+				}
+				if _, err = tx.ExecContext(ctx, `UPDATE account_groups SET allowed_models=$3 WHERE account_id=$1 AND group_id=$2`, plan.AccountID, group.GroupID, string(payload)); err != nil {
+					return "", err
+				}
+				state.Removed = append(state.Removed, group)
+				changed = true
+			}
+			if changed {
+				action = "series_split_degraded"
+				_, err = tx.ExecContext(ctx, `UPDATE accounts SET updated_at=clock_timestamp() WHERE id=$1`, plan.AccountID)
+			}
+		}
+		if err != nil {
+			return "", err
+		}
+		if changed {
+			if err = tx.QueryRowContext(ctx, `SELECT updated_at FROM accounts WHERE id=$1`, plan.AccountID).Scan(&state.AccountVersion); err != nil {
+				return "", err
+			}
+			state.Remaining, err = qualityGroups(ctx, tx, plan.AccountID)
+			if err != nil {
+				return "", err
+			}
+			data, marshalErr := json.Marshal(state)
+			if marshalErr != nil {
+				return "", marshalErr
+			}
+			if _, err = tx.ExecContext(ctx, `INSERT INTO account_quality_states(plan_id,state) VALUES($1,$2) ON CONFLICT (plan_id) DO UPDATE SET state=EXCLUDED.state`, plan.ID, string(data)); err != nil {
+				return "", err
+			}
+		}
+	case outcome == "passed" && q.Action == "excel_mode":
+		// 判定通过：不关闭 Excel/BPS（BPS 被拒时会自动回退标准端点），也不清理状态；
+		// Excel 只在答错时开启，6 系由 Excel/BPS 403 逻辑摘除。
+		action = "passed"
+	case outcome == "passed" && q.Action == "series_split":
+		// 通过：把此前摘掉的 6 系模型加回该账号的目标分组白名单（6 系 + 其它模型），
+		// 并清除本规则的状态标记；一次通过即恢复，不受 pass_streak 防抖约束。
+		var all []qualityGroup
+		if err = json.Unmarshal(groups, &all); err != nil {
+			return "", err
+		}
+		selected := map[int64]bool{}
+		for _, id := range q.RemoveGroupIDs {
+			selected[id] = true
+		}
+		applyAll := len(selected) == 0
+		for _, group := range all {
+			if !applyAll && !selected[group.GroupID] {
+				continue
+			}
+			six, other, splitErr := qualitySeriesSplitModels(ctx, tx, plan.AccountID, group.GroupID)
+			if splitErr != nil {
+				return "", splitErr
+			}
+			if len(six)+len(other) == 0 {
+				continue
+			}
+			full := append(append([]string{}, six...), other...)
+			payload, marshalErr := json.Marshal(full)
+			if marshalErr != nil {
+				return "", marshalErr
+			}
+			if _, err = tx.ExecContext(ctx, `UPDATE account_groups SET allowed_models=$3 WHERE account_id=$1 AND group_id=$2`, plan.AccountID, group.GroupID, string(payload)); err != nil {
+				return "", err
+			}
+			changed = true
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET updated_at=clock_timestamp() WHERE id=$1`, plan.AccountID); err != nil {
+			return "", err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM account_quality_states WHERE plan_id=$1`, plan.ID); err != nil {
+			return "", err
+		}
+		action = qualityActionSeriesRestored
+	case outcome == "passed" && state.Action != "" && q.AutoRestore:
+		// Restore only the mutation owned by this quality rule. Other account or
+		// membership edits must not turn an enabled auto-restore rule into a
+		// manual cleanup task. A non-active account is not safe to reactivate.
+		if status != "active" {
+			return "restore_conflict", nil
+		}
+		switch state.Action {
+		case "disable_scheduling":
+			_, err = tx.ExecContext(ctx, `UPDATE accounts SET schedulable=true, updated_at=clock_timestamp() WHERE id=$1 AND (expires_at IS NULL OR expires_at>NOW())`, plan.AccountID)
+			if err == nil {
+				var enabled bool
+				err = tx.QueryRowContext(ctx, `SELECT schedulable FROM accounts WHERE id=$1`, plan.AccountID).Scan(&enabled)
+				if err == nil && !enabled {
+					return "restore_conflict", nil
+				}
+			}
+		case "remove_groups":
+			for _, group := range state.Removed {
+				var exists bool
+				if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM groups WHERE id=$1 AND deleted_at IS NULL)`, group.GroupID).Scan(&exists); err != nil {
+					return "", err
+				}
+				if !exists {
+					return "restore_conflict", nil
+				}
+				var allowed any
+				if len(group.AllowedModels) > 0 && string(group.AllowedModels) != "null" {
+					allowed = string(group.AllowedModels)
+				}
+				if _, err = tx.ExecContext(ctx, `INSERT INTO account_groups(account_id,group_id,priority,created_at,allowed_models) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, plan.AccountID, group.GroupID, group.Priority, group.CreatedAt, allowed); err != nil {
+					return "", err
+				}
+			}
+			_, err = tx.ExecContext(ctx, `UPDATE accounts SET updated_at=clock_timestamp() WHERE id=$1`, plan.AccountID)
+		}
+		if err != nil {
+			return "", err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM account_quality_states WHERE plan_id=$1`, plan.ID); err != nil {
+			return "", err
+		}
+		changed = true
+		action = "restored"
+	case outcome == "passed":
+		action = "passed"
+	}
+	if changed {
+		// Include removed groups so their cached scheduling buckets are rebuilt too.
+		var all []qualityGroup
+		if err = json.Unmarshal(groups, &all); err != nil {
+			return "", err
+		}
+		ids := make([]int64, 0, len(all)+len(state.Removed))
+		for _, g := range all {
+			ids = append(ids, g.GroupID)
+		}
+		for _, g := range state.Removed {
+			ids = append(ids, g.GroupID)
+		}
+		payload, marshalErr := json.Marshal(map[string]any{"group_ids": ids})
+		if marshalErr != nil {
+			return "", marshalErr
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO scheduler_outbox(event_type,account_id,payload) VALUES('account_groups_changed',$1,$2)`, plan.AccountID, string(payload)); err != nil {
+			return "", err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	return action, nil
+}
+func qualityGroups(ctx context.Context, tx *sql.Tx, accountID int64) ([]byte, error) {
+	var raw []byte
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(jsonb_agg(to_jsonb(g) ORDER BY g.group_id),'[]'::jsonb) FROM account_groups g WHERE account_id=$1`, accountID).Scan(&raw)
+	return raw, err
+}
+
+// Global operation history is cursor-paginated independently of account/rule selection.
+// Response bodies are loaded through the existing per-result detail endpoint.
+
+func (r *scheduledTestResultRepository) ListQualityHistory(ctx context.Context, beforeID int64, limit int) ([]*service.QualityHistoryResult, error) {
+	rows, err := r.db.QueryContext(ctx, `WITH rounds AS (
+ SELECT r.*, a.id AS account_id,a.name AS account_name,
+ row_number() OVER round_window AS row_in_round,
+ count(*) FILTER (WHERE r.status='success') OVER round_window AS passed_count,
+ GREATEST(count(*) OVER round_window,COALESCE((r.pelican_config->>'parallel_count')::int,0)) AS total_count,
+ array_agg(r.id) OVER round_window AS result_ids,
+ min(r.started_at) OVER round_window AS round_started_at,
+ max(r.finished_at) OVER round_window AS round_finished_at,
+ bool_and(r.status='success') OVER round_window AS all_passed,
+ bool_or(r.error_message='answer_mismatch') OVER round_window AS any_wrong
+ FROM scheduled_test_results r JOIN scheduled_test_plans p ON p.id=r.plan_id JOIN accounts a ON a.id=p.account_id
+ WHERE r.pelican_config->'quality' IS NOT NULL AND a.deleted_at IS NULL
+ WINDOW round_window AS (PARTITION BY r.plan_id,COALESCE(NULLIF(r.quality_round_id,''),r.id::text) ORDER BY r.id DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+ ) SELECT id,plan_id,CASE WHEN all_passed THEN 'success' ELSE 'failed' END,
+ CASE WHEN any_wrong THEN 'answer_mismatch' ELSE error_message END,
+ latency_ms,round_started_at,round_finished_at,created_at,pelican_config,quality_action,quality_judgment,account_id,account_name,passed_count,total_count,result_ids
+ FROM rounds WHERE row_in_round=1 AND ($1::bigint=0 OR id<$1) ORDER BY id DESC LIMIT $2`, beforeID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	items := make([]*service.QualityHistoryResult, 0)
+	for rows.Next() {
+		item := &service.QualityHistoryResult{}
+		var cfg, judgment []byte
+		if err := rows.Scan(&item.ID, &item.PlanID, &item.Status, &item.ErrorMessage, &item.LatencyMs, &item.StartedAt, &item.FinishedAt, &item.CreatedAt, &cfg, &item.QualityAction, &judgment, &item.AccountID, &item.AccountName, &item.PassedCount, &item.TotalCount, pq.Array(&item.ResultIDs)); err != nil {
+			return nil, err
+		}
+		if len(cfg) > 0 {
+			if err := json.Unmarshal(cfg, &item.PelicanConfig); err != nil {
+				return nil, err
+			}
+		}
+		if len(judgment) > 0 {
+			if err := json.Unmarshal(judgment, &item.QualityJudgment); err != nil {
+				return nil, err
+			}
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// qualityOutcomeStreak 统计该计划最近连续多少次得到同一结论（含本轮）。
+// 只有 status/verdict 明确一致才算，inconclusive 或传输错误会打断连续计数。
+func qualityOutcomeStreak(ctx context.Context, tx *sql.Tx, planID int64, outcome string, required int) (int, error) {
+	if required <= 1 {
+		return 1, nil
+	}
+	want := "fail"
+	if outcome == "passed" {
+		want = "pass"
+	}
+	rows, err := tx.QueryContext(ctx, `
+SELECT CASE
+         WHEN status='success' AND quality_judgment->>'verdict'='correct' THEN 'pass'
+         WHEN status='failed' AND error_message='answer_mismatch' THEN 'fail'
+         ELSE 'other'
+       END
+FROM scheduled_test_results
+WHERE plan_id=$1
+ORDER BY id DESC
+LIMIT $2`, planID, required-1)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rows.Close() }()
+	streak := 0
+	for rows.Next() {
+		var kind string
+		if err := rows.Scan(&kind); err != nil {
+			return 0, err
+		}
+		if kind != want {
+			break
+		}
+		streak++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return streak + 1, nil
+}
