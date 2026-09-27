@@ -22,7 +22,7 @@
       <p v-if="notice" role="status" class="success-banner">{{ notice }}</p>
 
       <section class="summary-grid">
-        <article class="summary-card"><span>{{ t('tokenGuard.statsProbed') }}</span><strong>{{ remote?.runtime.stats.probed ?? 0 }}</strong><small>{{ t('tokenGuard.interval') }} {{ draft?.interval_seconds ?? 0 }}s</small></article>
+        <article class="summary-card"><span>{{ t('tokenGuard.statsProbed') }}</span><strong>{{ remote?.runtime.stats.probed ?? 0 }}</strong><small>{{ remote?.runtime.job?.status === 'running' ? `${remote.runtime.job.completed}/${remote.runtime.job.total}` : `${t('tokenGuard.interval')} ${draft?.interval_seconds ?? 0}s` }}</small></article>
         <article class="summary-card"><span>{{ t('tokenGuard.statsBad') }}</span><strong>{{ badCount }}</strong><small>{{ t('tokenGuard.failStreak') }} ≥ {{ draft?.fail_streak_threshold ?? 1 }}</small></article>
         <article class="summary-card"><span>{{ t('tokenGuard.statsRepaired') }}</span><strong>{{ remote?.runtime.stats.repaired ?? 0 }}</strong><small>{{ t('tokenGuard.stateFixed') }} {{ remote?.runtime.stats.state_fixed ?? 0 }}</small></article>
         <article class="summary-card"><span>{{ t('tokenGuard.lastRun') }}</span><strong class="text-base">{{ remote?.runtime.last_run ? date(remote.runtime.last_run) : t('tokenGuard.never') }}</strong><small>{{ remote?.runtime.last_message || '-' }}</small></article>
@@ -35,7 +35,16 @@
             <fieldset :disabled="saving">
               <label class="enable-row"><span><strong>{{ t('tokenGuard.enabled') }}</strong><small>{{ t('tokenGuard.enabledHint') }}</small></span><input v-model="draft.enabled" type="checkbox" role="switch" :aria-label="t('tokenGuard.enabled')" /></label>
               <label class="field-label">{{ t('tokenGuard.groupIds') }}</label>
-              <input v-model="groupIdsText" class="input w-full" placeholder="1, 2" />
+              <Select
+                v-model="selectedGroupIds"
+                multiple
+                searchable
+                :options="groupOptions"
+                :placeholder="t('tokenGuard.allGroups')"
+                :aria-label="t('tokenGuard.groupIds')"
+                :disabled="groupsLoading"
+              />
+              <p v-if="groupsLoadError" class="field-hint text-amber-600 dark:text-amber-400">{{ t('tokenGuard.groupsLoadError') }}</p>
               <p class="field-hint">{{ t('tokenGuard.groupIdsHint') }}</p>
 
               <div class="grid-2">
@@ -59,13 +68,6 @@
               <textarea v-model="reloginHeadersText" rows="3" class="input w-full" placeholder="Header-Name: value"></textarea>
               <p class="field-hint">{{ t('tokenGuard.headersHint') }}</p>
               <label class="kind-option"><input v-model="draft.restore_schedulable" type="checkbox" /><span><strong>{{ t('tokenGuard.restoreSchedulable') }}</strong><small>{{ t('tokenGuard.scopeNote') }}</small></span></label>
-
-              <label class="kind-option"><input v-model="draft.series_fallback_enabled" type="checkbox" /><span><strong>{{ t('tokenGuard.seriesFallback') }}</strong><small>{{ t('tokenGuard.seriesFallbackHint') }}</small></span></label>
-              <div v-if="draft.series_fallback_enabled" class="grid-2">
-                <label class="field-label">{{ t('tokenGuard.seriesFallbackGroups') }}<input v-model="seriesGroupsText" class="input w-full" placeholder="43" /></label>
-                <label class="field-label">{{ t('tokenGuard.seriesFallbackPrefix') }}<input v-model.trim="draft.series_fallback_prefix" class="input w-full" placeholder="gpt-6" /></label>
-                <label class="field-label">{{ t('tokenGuard.seriesFallbackLimit') }}<input v-model.number="draft.series_fallback_limit" type="number" min="1" max="10" class="input w-full" /></label>
-              </div>
 
               <label class="field-label">{{ t('tokenGuard.reloginAccounts') }}</label>
               <textarea v-model="reloginText" rows="7" class="input w-full font-mono text-xs" placeholder="user@example.com----password----JBSWY3DPEHPK3PXP"></textarea>
@@ -135,10 +137,15 @@ import { useI18n } from 'vue-i18n'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import SmartOpsNav from '@/components/admin/operations/SmartOpsNav.vue'
 import Icon from '@/components/icons/Icon.vue'
+import Select from '@/components/common/Select.vue'
+import { groupsAPI } from '@/api/admin/groups'
+import type { AdminGroup, SelectOption } from '@/types'
 import {
   getTokenGuardStatus,
+  formatTokenGuardReloginText,
+  parseTokenGuardReloginText,
   reloginTokenGuardAccount,
-  runTokenGuard,
+  startTokenGuardRun,
   saveTokenGuardConfig,
   type TokenGuardConfig,
   type TokenGuardEvent,
@@ -148,19 +155,42 @@ import {
 const { t } = useI18n()
 const remote = ref<TokenGuardStatus | null>(null)
 const draft = ref<TokenGuardConfig | null>(null)
-const groupIdsText = ref('')
 const reloginText = ref('')
 const probeHeadersText = ref('')
-const seriesGroupsText = ref('')
 const reloginHeadersText = ref('')
 const loading = ref(false), saving = ref(false), running = ref(false), reloginBusy = ref(0)
 const error = ref(''), notice = ref('')
+const groups = ref<AdminGroup[]>([])
+const groupsLoading = ref(false)
+const groupsLoadError = ref(false)
 let timer: ReturnType<typeof setInterval> | undefined
 let alive = true
 
 const accounts = computed(() => remote.value?.accounts ?? [])
 const events = computed<TokenGuardEvent[]>(() => remote.value?.events ?? [])
 const badCount = computed(() => accounts.value.filter(item => item.probe_state === 'auth' || item.account_status === 'error').length)
+const selectedGroupIds = computed<number[]>({
+  get: () => draft.value?.group_ids ?? [],
+  set: (value) => {
+    if (draft.value) {
+      draft.value = {
+        ...draft.value,
+        group_ids: [...new Set(value.map(Number).filter(id => Number.isInteger(id) && id > 0))]
+      }
+    }
+  }
+})
+const groupOptions = computed<SelectOption[]>(() => {
+  const known = groups.value.map(group => ({
+    value: group.id,
+    label: `${group.name} (#${group.id})`
+  }))
+  const knownIds = new Set(groups.value.map(group => group.id))
+  const missing = selectedGroupIds.value
+    .filter(id => !knownIds.has(id))
+    .map(id => ({ value: id, label: `#${id}` }))
+  return [...missing, ...known]
+})
 const dirty = computed(() => {
   if (!draft.value || !remote.value) return false
   return JSON.stringify(collect()) !== JSON.stringify(normalize(remote.value.config))
@@ -172,12 +202,7 @@ const date = (value: string) => {
   return Number.isNaN(parsed.getTime()) ? value : `${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`
 }
 const message = (e: unknown) => (e as { message?: string })?.message || t('qualityOps.error')
-const parseGroupIds = (raw: string) => raw.split(/[,\s;]+/).map(value => Number(value.trim())).filter(value => Number.isFinite(value) && value > 0)
-const parseRelogin = (raw: string) => raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => {
-  const [email = '', password = '', mfa = ''] = line.split('----')
-  return { email: email.trim(), password: password.trim(), mfa_secret: mfa.trim() }
-}).filter(item => item.email && item.password)
-const reloginTextOf = (config: TokenGuardConfig | null) => (config?.relogin_accounts ?? []).map(item => `${item.email}----${item.password}----${item.mfa_secret}`).join('\n')
+const reloginTextOf = (config: TokenGuardConfig | null) => formatTokenGuardReloginText(config?.relogin_accounts)
 const parseHeaders = (raw: string) => raw.split(/\r?\n/).reduce<Record<string, string>>((acc, line) => {
   const index = line.indexOf(':')
   if (index > 0) {
@@ -188,24 +213,20 @@ const parseHeaders = (raw: string) => raw.split(/\r?\n/).reduce<Record<string, s
   return acc
 }, {})
 const headersTextOf = (headers: Record<string, string> | undefined) => Object.entries(headers ?? {}).map(([name, value]) => `${name}: ${value}`).join('\n')
-const groupTextOf = (config: TokenGuardConfig | null) => (config?.group_ids ?? []).join(', ')
-
 function normalize(config: TokenGuardConfig): TokenGuardConfig {
   return {
     ...config,
     group_ids: [...(config.group_ids ?? [])].sort((a, b) => a - b),
     relogin_accounts: [...(config.relogin_accounts ?? [])].map(item => ({ email: item.email.toLowerCase(), password: item.password, mfa_secret: item.mfa_secret })).sort((a, b) => a.email.localeCompare(b.email)),
     probe_headers: config.probe_headers ?? {},
-    relogin_headers: config.relogin_headers ?? {},
-    series_fallback_groups: [...(config.series_fallback_groups ?? [])].sort((a, b) => a - b)
+    relogin_headers: config.relogin_headers ?? {}
   }
 }
 
 function collect(): TokenGuardConfig {
   const base = draft.value!
-  return normalize({ ...base, group_ids: parseGroupIds(groupIdsText.value), relogin_accounts: parseRelogin(reloginText.value),
-    probe_headers: parseHeaders(probeHeadersText.value), relogin_headers: parseHeaders(reloginHeadersText.value),
-    series_fallback_groups: parseGroupIds(seriesGroupsText.value) })
+  return normalize({ ...base, group_ids: base.group_ids, relogin_accounts: parseTokenGuardReloginText(reloginText.value),
+    probe_headers: parseHeaders(probeHeadersText.value), relogin_headers: parseHeaders(reloginHeadersText.value) })
 }
 
 const probeClass = (state: string) => (state === 'ok' ? 'ok' : state === 'auth' ? 'danger' : '')
@@ -222,16 +243,26 @@ async function load(silent = false) {
     remote.value = status
     if (!preserveDraft) {
       draft.value = { ...status.config }
-      groupIdsText.value = groupTextOf(status.config)
       reloginText.value = reloginTextOf(status.config)
       probeHeadersText.value = headersTextOf(status.config.probe_headers)
       reloginHeadersText.value = headersTextOf(status.config.relogin_headers)
-      seriesGroupsText.value = (status.config.series_fallback_groups ?? []).join(', ')
     }
   } catch (e) {
     if (alive && !silent) error.value = message(e)
   } finally {
     loading.value = false
+  }
+}
+
+async function loadGroups() {
+  groupsLoading.value = true
+  groupsLoadError.value = false
+  try {
+    groups.value = await groupsAPI.getAll('openai')
+  } catch {
+    groupsLoadError.value = true
+  } finally {
+    groupsLoading.value = false
   }
 }
 
@@ -242,11 +273,9 @@ async function save() {
     const saved = await saveTokenGuardConfig(collect())
     if (!alive) return
     draft.value = { ...saved }
-    groupIdsText.value = groupTextOf(saved)
     reloginText.value = reloginTextOf(saved)
     probeHeadersText.value = headersTextOf(saved.probe_headers)
     reloginHeadersText.value = headersTextOf(saved.relogin_headers)
-    seriesGroupsText.value = (saved.series_fallback_groups ?? []).join(', ')
     if (remote.value) remote.value = { ...remote.value, config: saved }
     notice.value = t('tokenGuard.saved')
   } catch (e) {
@@ -260,8 +289,24 @@ async function run() {
   if (running.value) return
   running.value = true; error.value = ''; notice.value = ''
   try {
-    const stats = await runTokenGuard()
+    const job = await startTokenGuardRun()
     if (!alive) return
+    let current = job
+    while (alive && (current.status === 'pending' || current.status === 'running')) {
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      await load(true)
+      const polled = remote.value?.runtime.job
+      if (polled?.id === job.id) current = polled
+    }
+    if (!alive) return
+    if (current.status === 'failed') {
+      throw new Error(current.error || t('qualityOps.error'))
+    }
+    if (current.status === 'canceled') {
+      notice.value = t('tokenGuard.runCanceled')
+      return
+    }
+    const stats = current.stats
     notice.value = t('tokenGuard.runDone', { probed: stats.probed, healthy: stats.healthy, repaired: stats.repaired, state_fixed: stats.state_fixed })
     await load(true)
   } catch (e) {
@@ -288,6 +333,7 @@ async function relogin(item: { account_id: number }) {
 
 onMounted(() => {
   void load()
+  void loadGroups()
   timer = setInterval(() => { if (document.visibilityState === 'visible') void load(true) }, 30_000)
 })
 onBeforeUnmount(() => { alive = false; if (timer) clearInterval(timer) })

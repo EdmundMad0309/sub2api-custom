@@ -18,13 +18,13 @@ import (
 
 func TestBPSHealthQuarantineAndRecovery(t *testing.T) {
 	m := bpsTestManager(t)
-	first, err := m.acquireBPSLease(context.Background(), "a", nil)
+	first, err := m.probeBPSLease(context.Background(), "a", nil)
 	require.NoError(t, err)
 	first.ReportFailure()
 	first.ReportFailure() // duplicate reporting of an attempt is harmless
 	first.Release()
 	require.Equal(t, 1, m.bpsHealth[first.node].failures)
-	next, err := m.acquireBPSLease(context.Background(), "a", nil)
+	next, err := m.probeBPSLease(context.Background(), "a", nil)
 	require.NoError(t, err)
 	require.NotEqual(t, first.ProxyURL, next.ProxyURL)
 	next.Release()
@@ -46,7 +46,7 @@ func TestBPSHealthQuarantineAndRecovery(t *testing.T) {
 	m.bpsMu.Lock()
 	m.bpsFailureLocked(first.node, time.Now())
 	m.bpsMu.Unlock()
-	again, err := m.acquireBPSLease(context.Background(), "a", nil)
+	again, err := m.probeBPSLease(context.Background(), "a", nil)
 	require.NoError(t, err)
 	require.Equal(t, next.ProxyURL, again.ProxyURL)
 	again.Release()
@@ -58,14 +58,23 @@ func TestBPSHealthPreflightFailoverAndNoDirectFallback(t *testing.T) {
 	require.NoError(t, err)
 	release()
 	calls := map[string]int{}
+	var callsMu sync.Mutex
+	failed := make(chan struct{})
 	m.bpsProbe = func(_ context.Context, p string) error {
+		callsMu.Lock()
 		calls[p]++
+		n := calls[p]
+		callsMu.Unlock()
 		if p == proxy {
+			if n == 2 {
+				close(failed)
+			}
 			return errors.New("proxy timeout")
 		}
+		<-failed
 		return nil
 	}
-	lease, err := m.acquireBPSLease(context.Background(), "a", nil)
+	lease, err := m.probeBPSLease(context.Background(), "a", nil)
 	require.NoError(t, err)
 	require.NotEqual(t, proxy, lease.ProxyURL)
 	require.Equal(t, 2, calls[proxy], "confirm failure before cooldown")
@@ -73,7 +82,7 @@ func TestBPSHealthPreflightFailoverAndNoDirectFallback(t *testing.T) {
 	lease.ReportFailure()
 	lease.Release()
 	m.bpsProbe = func(context.Context, string) error { return errors.New("down") }
-	_, err = m.acquireBPSLease(context.Background(), "a", nil)
+	_, err = m.probeBPSLease(context.Background(), "a", nil)
 	require.Error(t, err)
 	for _, binding := range m.bpsSessions {
 		require.Zero(t, binding.active)
@@ -82,22 +91,22 @@ func TestBPSHealthPreflightFailoverAndNoDirectFallback(t *testing.T) {
 
 func TestBPSHealthActiveRequestsDrainBeforeRebind(t *testing.T) {
 	m := bpsTestManager(t)
-	a, err := m.acquireBPSLease(context.Background(), "shared", nil)
+	a, err := m.probeBPSLease(context.Background(), "shared", nil)
 	require.NoError(t, err)
-	b, err := m.acquireBPSLease(context.Background(), "shared", nil)
+	b, err := m.probeBPSLease(context.Background(), "shared", nil)
 	require.NoError(t, err)
 	a.ReportFailure()
 	a.Release()
-	_, err = m.acquireBPSLease(context.Background(), "shared", nil)
+	_, err = m.probeBPSLease(context.Background(), "shared", nil)
 	require.ErrorContains(t, err, "requests are active")
 	b.Release()
-	replacement, err := m.acquireBPSLease(context.Background(), "shared", nil)
+	replacement, err := m.probeBPSLease(context.Background(), "shared", nil)
 	require.NoError(t, err)
 	require.NotEqual(t, a.ProxyURL, replacement.ProxyURL)
 	// A late report is tied to b's old node, not to the current session.
 	b.ReportFailure()
 	replacement.Release()
-	again, err := m.acquireBPSLease(context.Background(), "shared", nil)
+	again, err := m.probeBPSLease(context.Background(), "shared", nil)
 	require.NoError(t, err)
 	require.Equal(t, replacement.ProxyURL, again.ProxyURL)
 	again.Release()
@@ -105,6 +114,10 @@ func TestBPSHealthActiveRequestsDrainBeforeRebind(t *testing.T) {
 
 func TestBPSHealthSingleFlight(t *testing.T) {
 	m := bpsTestManager(t)
+	// Existing active affinity probes only its bound exit, once for all waiters.
+	_, release, err := m.acquireBPSSession("shared", time.Now())
+	require.NoError(t, err)
+	defer release()
 	started, finish := make(chan struct{}), make(chan struct{})
 	var calls atomic.Int32
 	m.bpsProbe = func(context.Context, string) error {
@@ -119,7 +132,7 @@ func TestBPSHealthSingleFlight(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lease, err := m.acquireBPSLease(context.Background(), "shared", nil)
+			lease, err := m.probeBPSLease(context.Background(), "shared", nil)
 			if err != nil {
 				t.Error(err)
 				return
@@ -135,7 +148,7 @@ func TestBPSHealthSingleFlight(t *testing.T) {
 
 func TestBPSHealthStaleProbeCannotClearNewFailure(t *testing.T) {
 	m := bpsTestManager(t)
-	first, err := m.acquireBPSLease(context.Background(), "a", nil)
+	first, err := m.probeBPSLease(context.Background(), "a", nil)
 	require.NoError(t, err)
 	first.Release()
 	m.bpsHealth[first.node].verifiedUntil = time.Time{}
@@ -155,7 +168,7 @@ func TestBPSHealthCanceledProbeDoesNotQuarantine(t *testing.T) {
 	m := bpsTestManager(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	m.bpsProbe = func(context.Context, string) error { cancel(); return context.Canceled }
-	_, err := m.acquireBPSLease(ctx, "a", nil)
+	_, err := m.probeBPSLease(ctx, "a", nil)
 	require.ErrorIs(t, err, context.Canceled)
 	for _, h := range m.bpsHealth {
 		require.Zero(t, h.failures)
@@ -168,11 +181,11 @@ func TestBPSHealthCanceledProbeDoesNotQuarantine(t *testing.T) {
 
 func TestBPSHealthCountryFilterStillFailsClosed(t *testing.T) {
 	m := bpsTestManager(t)
-	lease, err := m.acquireBPSLease(context.Background(), "a", nil)
+	lease, err := m.probeBPSLease(context.Background(), "a", nil)
 	require.NoError(t, err)
 	lease.Release()
 	m.saved.CountryFilter = CountryFilter{Mode: "include", Codes: []string{"US"}}
-	_, err = m.acquireBPSLease(context.Background(), "a", nil)
+	_, err = m.probeBPSLease(context.Background(), "a", nil)
 	require.ErrorContains(t, err, "no eligible")
 }
 
@@ -209,14 +222,20 @@ func TestBPSHealthProbeUsesExplicitProxyWithoutCredentials(t *testing.T) {
 
 func TestBPSHealthBoundsConsecutiveBadExits(t *testing.T) {
 	m := bpsTestManager(t)
-	for i := 0; i < 8; i++ {
+	for i := 0; i < bpsMaxCandidateProbes+5; i++ {
 		m.saved.Nodes = append(m.saved.Nodes, map[string]any{"name": fmt.Sprintf("extra-%d", i)})
 	}
 	_, err := m.config(m.saved)
 	require.NoError(t, err)
 	calls := map[string]int{}
-	m.bpsProbe = func(_ context.Context, p string) error { calls[p]++; return errors.New("unreachable") }
-	_, err = m.acquireBPSLease(context.Background(), "a", nil)
+	var callsMu sync.Mutex
+	m.bpsProbe = func(_ context.Context, p string) error {
+		callsMu.Lock()
+		calls[p]++
+		callsMu.Unlock()
+		return errors.New("unreachable")
+	}
+	_, err = m.probeBPSLease(context.Background(), "a", nil)
 	require.ErrorContains(t, err, "exhausted")
 	require.Len(t, calls, bpsMaxCandidateProbes)
 	for _, n := range calls {
@@ -235,17 +254,18 @@ func TestBPSHealthPoolChangesDuringProbe(t *testing.T) {
 		m.mu.Unlock()
 		return nil
 	}
-	_, err := m.acquireBPSLease(context.Background(), "a", nil)
+	_, err := m.probeBPSLease(context.Background(), "a", nil)
 	require.ErrorContains(t, err, "no eligible")
 }
 
 func TestBPSHealthFailedRecoveryStaysQuarantined(t *testing.T) {
 	m := bpsTestManager(t)
-	lease, err := m.acquireBPSLease(context.Background(), "a", nil)
+	lease, err := m.probeBPSLease(context.Background(), "a", nil)
 	require.NoError(t, err)
 	lease.ReportFailure()
 	lease.Release()
 	h := m.bpsHealth[lease.node]
+	h.retryAfter = time.Now().Add(-time.Second)
 	calls := 0
 	m.bpsProbe = func(context.Context, string) error {
 		calls++
@@ -262,7 +282,7 @@ func TestBPSHealthFailedRecoveryStaysQuarantined(t *testing.T) {
 
 func TestBPSBrokenStreamsDoNotBounceBetweenNodes(t *testing.T) {
 	m := bpsTestManager(t)
-	first, err := m.acquireBPSLease(context.Background(), "conversation", nil)
+	first, err := m.probeBPSLease(context.Background(), "conversation", nil)
 	require.NoError(t, err)
 	first.ReportStreamFailure()
 	first.ReportStreamFailure()
@@ -270,12 +290,12 @@ func TestBPSBrokenStreamsDoNotBounceBetweenNodes(t *testing.T) {
 	h := m.bpsHealth[first.node]
 	require.Equal(t, 1, h.streamFailures)
 	require.WithinDuration(t, time.Now().Add(bpsStreamCooldown), h.retryAfter, time.Second)
-	second, err := m.acquireBPSLease(context.Background(), "conversation", nil)
+	second, err := m.probeBPSLease(context.Background(), "conversation", nil)
 	require.NoError(t, err)
 	require.NotEqual(t, first.node, second.node)
 	second.ReportStreamFailure()
 	second.Release()
-	_, err = m.acquireBPSLease(context.Background(), "conversation", nil)
+	_, err = m.probeBPSLease(context.Background(), "conversation", nil)
 	require.Error(t, err, "both broken exits must remain quarantined, not bounce back")
 	require.Error(t, m.checkBPSHealth(context.Background(), first.node, first.ProxyURL))
 	// Recovered HTTPS reachability must not erase recent stream failures.
@@ -301,7 +321,7 @@ func TestBPSBrokenStreamsDoNotBounceBetweenNodes(t *testing.T) {
 
 func TestBPSTransientLeasesReleaseSessionCapacity(t *testing.T) {
 	m := bpsTestManager(t)
-	sticky, err := m.acquireBPSLease(context.Background(), "sticky", nil)
+	sticky, err := m.probeBPSLease(context.Background(), "sticky", nil)
 	require.NoError(t, err)
 	sticky.Release()
 	for i := 0; i < bpsMaxSessions+10; i++ {

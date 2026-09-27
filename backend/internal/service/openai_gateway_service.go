@@ -450,11 +450,16 @@ var ErrNoAvailableCompactAccounts = errors.New("no available accounts support /r
 
 // OpenAIGatewayService handles OpenAI API gateway operations
 type OpenAIGatewayService struct {
+	excelBPSWarmMu         sync.Mutex
+	excelBPSWarmCancel     context.CancelFunc
+	excelBPSWarmDone       chan struct{}
+	excelBPSWarmStopped    bool
 	excelBPSImagesMu       sync.Mutex
 	excelBPSImages         *basispoints.ImageRelay
 	excelBPSAttachments    basispoints.AttachmentCache
 	excelBPSIPPoolMu       sync.Mutex
 	excelBPSIPPoolSyncedAt time.Time
+	excelBPSCooldownUntil  sync.Map // key: int64(accountID), value: time.Time
 	harvestIPPoolMu        sync.Mutex
 	harvestIPPoolExits     []harvestIPPoolExit
 	harvestIPPoolSyncedAt  time.Time

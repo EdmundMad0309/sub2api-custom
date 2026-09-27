@@ -25,6 +25,10 @@ func bpsTestManager(t *testing.T) *Manager {
 
 func TestBPSSessionsConcurrentAndSticky(t *testing.T) {
 	m := bpsTestManager(t)
+	// Load distribution is checked across exits that have passed HTTPS preflight.
+	for node, port := range m.bpsPorts {
+		require.NoError(t, m.checkBPSHealth(context.Background(), node, fmt.Sprintf("http://127.0.0.1:%d", port)))
+	}
 	// Harvest is busy, but session allocation must not wait for its gate.
 	m.gate <- struct{}{}
 	defer m.release()
@@ -68,6 +72,10 @@ func TestBPSSessionsConcurrentAndSticky(t *testing.T) {
 
 func TestBPSSessionsDistribute200Sessions(t *testing.T) {
 	m := bpsTestManager(t)
+	// Load distribution is checked across exits that have passed HTTPS preflight.
+	for node, port := range m.bpsPorts {
+		require.NoError(t, m.checkBPSHealth(context.Background(), node, fmt.Sprintf("http://127.0.0.1:%d", port)))
+	}
 	var wg sync.WaitGroup
 	var allocated sync.WaitGroup
 	allocated.Add(200)
@@ -104,6 +112,7 @@ func TestBPSSessionsDistribute200Sessions(t *testing.T) {
 
 func TestBPSSessionUnavailableNodeRebinds(t *testing.T) {
 	m := bpsTestManager(t)
+	m.warmBPSPool(t.Context(), 2)
 	proxy, done, err := AcquireBPSSession(context.Background(), "a")
 	require.NoError(t, err)
 	done()
@@ -176,6 +185,7 @@ func TestBPSSessionCountryFilterAndIdentityChanges(t *testing.T) {
 	_, _, err := AcquireBPSSession(context.Background(), "a")
 	require.ErrorContains(t, err, "no eligible")
 	m.saved.CountryFilter = CountryFilter{Mode: "off"}
+	m.warmBPSPool(t.Context(), 2)
 	_, done, err := AcquireBPSSession(context.Background(), "a")
 	require.NoError(t, err)
 	done()
@@ -184,6 +194,7 @@ func TestBPSSessionCountryFilterAndIdentityChanges(t *testing.T) {
 	}
 	_, err = m.config(m.saved)
 	require.NoError(t, err)
+	m.warmBPSPool(t.Context(), 2)
 	_, release, err := AcquireBPSSession(context.Background(), "a")
 	require.NoError(t, err)
 	release()

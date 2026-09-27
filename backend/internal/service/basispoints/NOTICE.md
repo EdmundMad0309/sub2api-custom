@@ -45,6 +45,21 @@ endpoint and openai_file_id response field. The uploader and metadata cache
 are implemented in this package using Sub2API's existing image validation and
 account transport; no plugin runtime or deployment configuration is imported.
 
+## 2026-09-27 native tool screenshot correction
+
+The attachment implementation entered the owner fork in PR #102; PR #99
+subsequently integrated protocol completion. The image relay is tracked in PR #66.
+
+Behavioral correction reference: zhu961212/sub2api-oai-basispoints commit
+586dc42dccbed2d685ad35d8e1a0c96a2aea173c, internal/attachments/README.md
+and the associated tool image and detail tests. Its protocol investigation
+distinguishes user-message file_id attachments from inline image_url tool
+screenshots, with nullish detail defaulting to auto. This correction is
+independently implemented using the existing native image validation and
+request-scoped bridge; no source files were copied. The cited official
+frontend asset could not be fetched from this development environment, and
+no authenticated upstream visual acceptance test is claimed.
+
 ## 2026-09-26 OAuth encrypted-history recovery
 
 Reviewed JaxsonWang/cpa-plugin-oai-basispoints v0.1.18, commit

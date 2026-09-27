@@ -2205,6 +2205,31 @@ func (a *Account) IsExcelBPSEnabled() bool {
 	return enabled
 }
 
+const ExcelBPSIgnoreImagesKey = "openai_excel_bps_ignore_images"
+
+// IsExcelBPSIgnoreImagesEnabled opts into text-only forwarding when global BPS
+// image support is disabled. The forwarding path checks that global setting.
+func (a *Account) IsExcelBPSIgnoreImagesEnabled() bool {
+	if !a.IsExcelBPSEnabled() {
+		return false
+	}
+	enabled, _ := a.Extra[ExcelBPSIgnoreImagesKey].(bool)
+	return enabled
+}
+
+const ExcelBPSIgnoreEncryptedContentKey = "openai_excel_bps_ignore_encrypted_content"
+
+// IsExcelBPSIgnoreEncryptedContentEnabled opts into replacing ciphertext that
+// BPS cannot forward, such as sub-agent messages in an old Codex conversation,
+// with an omission notice instead of rejecting the whole request.
+func (a *Account) IsExcelBPSIgnoreEncryptedContentEnabled() bool {
+	if !a.IsExcelBPSEnabled() {
+		return false
+	}
+	enabled, _ := a.Extra[ExcelBPSIgnoreEncryptedContentKey].(bool)
+	return enabled
+}
+
 func (a *Account) IsExcelBPSMihomoEnabled() bool {
 	if !a.IsExcelBPSEnabled() {
 		return false
@@ -2255,8 +2280,7 @@ func (a *Account) IsExcelBPSAutoDisableOn403Enabled() bool {
 }
 
 // IsExcelBPSFallbackOn403Enabled 控制 Excel/BPS 返回 403 时是否在同一请求内
-// 回退到标准 Codex 端点（客户端无感）。默认关闭，与上游行为一致；质量运维
-// 的 Excel 模式会给账号自动打开。
+// 回退到标准 Codex 端点（客户端无感）。默认关闭；质量运维的 Excel 模式自动开启。
 func (a *Account) IsExcelBPSFallbackOn403Enabled() bool {
 	if !a.IsExcelBPSEnabled() {
 		return false

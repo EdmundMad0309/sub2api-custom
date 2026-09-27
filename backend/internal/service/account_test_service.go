@@ -154,6 +154,7 @@ type AccountTestService struct {
 	openaiGatewayService      *OpenAIGatewayService
 	bpsProbeMu                sync.Mutex
 	bpsProbeAccounts          map[int64]struct{}
+	stateProbeAccounts        sync.Map
 	agentIdentityTaskMu       sync.Mutex
 	agentIdentityWS           agentIdentityWSConnectionInvalidator
 	// grokWSDialer is optional; realtime account tests use the default OpenAI-style
@@ -1022,6 +1023,11 @@ func (s *AccountTestService) testExcelBPSAccountConnection(c *gin.Context, accou
 	}
 	result, err := s.openaiGatewayService.Forward(probeCtx, probeCtx, account, body)
 	if err != nil {
+		// A single-account test has no other account to fail over to.
+		var failover *UpstreamFailoverError
+		if errors.As(err, &failover) && failover.ClientMessage != "" {
+			return s.sendErrorAndEnd(c, failover.ClientMessage)
+		}
 		return s.sendErrorAndEnd(c, err.Error())
 	}
 
@@ -3377,7 +3383,7 @@ func (s *AccountTestService) RunTestBackground(ctx context.Context, accountID in
 
 	w := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(w)
-	ginCtx.Request = (&http.Request{}).WithContext(ctx)
+	ginCtx.Request = (&http.Request{Header: make(http.Header)}).WithContext(ctx)
 
 	testErr := s.TestAccountConnection(ginCtx, accountID, modelID, "", AccountTestModeDefault)
 

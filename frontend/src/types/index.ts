@@ -1383,6 +1383,8 @@ export interface WindowStats {
   cost: number // Account cost (account multiplier)
   standard_cost?: number
   user_cost?: number
+  lifetime_tokens?: number // All-time totals (no time filter)
+  lifetime_cost?: number
 }
 
 export interface UsageProgress {
@@ -1700,6 +1702,8 @@ export interface AdminDataImportResult {
 }
 
 export interface CodexSessionImportRequest {
+  /** Skip matching accounts without replacing their credentials or settings. */
+  skip_existing?: boolean
   content?: string
   contents?: string[]
   name?: string
@@ -2500,7 +2504,7 @@ export interface QualityPolicy {
 
 export interface PelicanTestConfig {
   quality?: QualityPolicy
-  question_kind?: 'candy' | 'pelican'
+  question_kind?: 'candy' | 'pelican' | 'state_probe'
   prompt: string
   reasoning_effort: string
   parallel_count: number

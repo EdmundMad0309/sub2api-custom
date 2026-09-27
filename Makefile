@@ -1,6 +1,9 @@
 .PHONY: build build-backend build-frontend test test-backend test-frontend test-frontend-critical
 
 FRONTEND_CRITICAL_VITEST := \
+	src/views/admin/__tests__/AccountQualityView.spec.ts \
+	src/utils/__tests__/qualityRulePatch.spec.ts \
+	src/stores/__tests__/accountQuality.spec.ts \
 	src/api/__tests__/observerUsage.spec.ts \
 	src/views/admin/__tests__/UsageView.spec.ts \
 	src/views/user/__tests__/UsageView.spec.ts \
@@ -20,6 +23,8 @@ FRONTEND_CRITICAL_VITEST := \
 	src/components/account/__tests__/OpenAIReferralCell.transport.spec.ts \
 	src/components/account/__tests__/OpenAIQuotaResetCell.spark_shadow.spec.ts \
 	src/components/account/__tests__/ExcelBPS403Badge.spec.ts \
+	src/components/account/__tests__/EditAccountModal.spec.ts \
+	src/components/account/__tests__/BulkEditAccountModal.spec.ts \
 	src/components/keys/__tests__/BulkEditKeysModal.spec.ts \
 	src/components/admin/user/__tests__/UserPlatformQuotaModal.spec.ts \
 	src/components/admin/user/__tests__/UserEditModal.spec.ts \

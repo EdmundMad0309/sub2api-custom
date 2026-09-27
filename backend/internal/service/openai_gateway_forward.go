@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
-	"github.com/Wei-Shaw/sub2api/internal/service/basispoints"
 	"io"
 	"net/http"
 	"net/url"
@@ -41,6 +40,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	account = latest
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)
+	// A failed account attempt must not leave a bypass reason on a later BPS response.
+	c.Writer.Header().Del("X-Codex2API-Basispoints-Bypass")
+	c.Writer.Header().Del("X-Codex2API-Upstream")
 	if shouldForwardOpenAIResponsesViaChatCompletions(account, body) {
 		SetActualOpenAIUpstreamEndpoint(c, "/v1/chat/completions")
 	}
@@ -80,34 +82,28 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 
 	modelForBPS := gjson.GetBytes(body, "model").String()
 	if c.GetBool(bpsAccountProbeRequiredContextKey) &&
-		(!account.IsExcelBPSEnabledForModel(modelForBPS) || basispoints.NativeFallbackReason(body) != "") {
+		(!account.IsExcelBPSEnabledForModel(modelForBPS) || account.excelBPSNativeFallbackReason(body) != "") {
 		return nil, errors.New("bps probe path is unavailable")
 	}
 	if account.IsExcelBPSEnabledForModel(modelForBPS) {
-		model := modelForBPS
-		if reason := basispoints.NativeFallbackReason(body); reason != "" {
-			// 报文形态 BPS 接不了（图片/工具等）：直接走标准 Codex 端点。
-			c.Header("X-Codex2API-Upstream", "codex")
-			c.Header("X-Codex2API-Basispoints-Bypass", reason)
-		} else {
-			// 每个请求都先打 BPS；只有上游在写出任何响应字节之前拒绝时，
-			// 才在同一请求内回退到标准 Codex 端点，客户端无感。
-			bpsResult, bpsErr := s.forwardExcelBPS(ctx, c, account, body, startTime)
-			if bpsErr == nil {
-				return bpsResult, nil
-			}
-			fallback := excelBPSFallbackCause(bpsErr)
-			if fallback == nil {
-				return bpsResult, bpsErr
-			}
-			resetExcelBPSOpsUpstreamError(c)
-			c.Header("X-Codex2API-Upstream", "codex")
-			c.Header("X-Codex2API-Basispoints-Bypass", "fallback")
-			c.Header("X-Codex2API-Basispoints-Fallback-Status", fmt.Sprintf("%d", fallback.StatusCode))
-			logExcelBPSFallback(account, model, fallback, time.Since(startTime))
-			if fallback.StatusCode == 403 {
-				go s.disableSixSeriesAfterExcelBPS403(ctx, account, model)
-			}
+		// BPS 账号的请求始终先打 BPS（上游 #140：不因工具能力绕回原生 Codex）；
+		// 仅当上游在接受请求前拒绝（尚未写出任何响应字节）时，才在同一请求内
+		// 回退到标准 Codex 端点，客户端无感。
+		bpsResult, bpsErr := s.forwardExcelBPS(ctx, c, account, body, startTime)
+		if bpsErr == nil {
+			return bpsResult, nil
+		}
+		fallback := excelBPSFallbackCause(bpsErr)
+		if fallback == nil {
+			return bpsResult, bpsErr
+		}
+		resetExcelBPSOpsUpstreamError(c)
+		c.Header("X-Codex2API-Upstream", "codex")
+		c.Header("X-Codex2API-Basispoints-Bypass", "fallback")
+		c.Header("X-Codex2API-Basispoints-Fallback-Status", fmt.Sprintf("%d", fallback.StatusCode))
+		logExcelBPSFallback(account, modelForBPS, fallback, time.Since(startTime))
+		if fallback.StatusCode == 403 {
+			go s.disableSixSeriesAfterExcelBPS403(ctx, account, modelForBPS)
 		}
 	}
 
