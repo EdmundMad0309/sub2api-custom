@@ -286,28 +286,3 @@ func restoreOpenAIResponsesNamespacePayload(c *gin.Context, payload []byte) ([]b
 	}
 	return payload, nil
 }
-
-// openAIResponsesInputCarriesToolCallNamespaces reports whether history items
-// already carry a tool-call namespace. Codex clients round-trip the field for
-// namespaced calls and upstreams such as the official Responses API reject the
-// history with "Missing namespace for function_call ..." when it was stripped.
-// Upstreams that reject the field instead are handled reactively by
-// openAIResponsesRejectedFieldRetry, which removes it again on demand.
-func openAIResponsesInputCarriesToolCallNamespaces(body []byte) bool {
-	input := gjson.GetBytes(body, "input")
-	if !input.IsArray() {
-		return false
-	}
-	found := false
-	input.ForEach(func(_, item gjson.Result) bool {
-		if !isOpenAIResponsesToolCallItemType(item.Get("type").String()) {
-			return true
-		}
-		if strings.TrimSpace(item.Get("namespace").String()) != "" {
-			found = true
-			return false
-		}
-		return true
-	})
-	return found
-}
