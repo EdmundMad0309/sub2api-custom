@@ -96,7 +96,6 @@ func (r *accountTokenGuardRepository) PruneEvents(ctx context.Context, before ti
 	return err
 }
 
-
 // ListSeriesAccess 返回目标分组内账号的「自身模型清单 + 各分组白名单」，供 6 系兜底判定。
 func (r *accountTokenGuardRepository) ListSeriesAccess(ctx context.Context, groupIDs []int64) ([]service.AccountTokenGuardSeriesAccount, error) {
 	if len(groupIDs) == 0 {

@@ -167,16 +167,20 @@ func newExcelBPSRequest(ctx context.Context, body []byte, token, accountID strin
 // only the selected account's bearer and ChatGPT account ID belong on this host.
 func (s *OpenAIGatewayService) forwardExcelBPS(ctx context.Context, c *gin.Context, account *Account, body []byte, start time.Time) (*OpenAIForwardResult, error) {
 	fail := func(status int, code, message string) (*OpenAIForwardResult, error) {
-		// compact keepalive 一旦把 SSE 头写出去，这个请求就不能再换上游重放，
-		// 只能在带内补一条失败消息收尾。写出之前则返回类型化回退错误，交给调用方
-		// 在同一请求里改走标准 Codex 端点（客户端无感）。
+		// A compact keepalive may already have committed SSE headers. Otherwise
+		// finish a single JSON response so the handler cannot append another error.
 		committed := StopOpenAICompactSSEKeepaliveCommitted(c)
+		MarkResponseCommitted(c)
 		if committed {
-			MarkResponseCommitted(c)
 			writeOpenAICompactSSEFailureMessage(c, status, code, message)
-			return nil, fmt.Errorf("excel BPS: %s", code)
+		} else {
+			errorType := "invalid_request_error"
+			if status >= 500 {
+				errorType = "server_error"
+			}
+			c.JSON(status, gin.H{"error": gin.H{"type": errorType, "code": code, "message": message}})
 		}
-		return nil, newExcelBPSFallbackError(status, code, message, "")
+		return nil, fmt.Errorf("excel BPS: %s", code)
 	}
 	originalModel := gjson.GetBytes(body, "model").String()
 	model := account.GetMappedModel(originalModel)
@@ -426,6 +430,16 @@ func (s *OpenAIGatewayService) forwardExcelBPS(ctx context.Context, c *gin.Conte
 			case moved:
 				message = "Excel BPS rejected this request; account groups were automatically updated; request was not replayed"
 			}
+		}
+		// 仅当账号显式开启回退开关且上游以 403 拒绝（usage policy 等封禁）时，
+		// 才在未写出响应前回退标准 Codex 端点；其余情况沿用原有失败处理。
+		if resp.StatusCode == http.StatusForbidden && account.IsExcelBPSFallbackOn403Enabled() {
+			if committed := StopOpenAICompactSSEKeepaliveCommitted(c); committed {
+				MarkResponseCommitted(c)
+				writeOpenAICompactSSEFailureMessage(c, resp.StatusCode, errorCode, message)
+				return nil, fmt.Errorf("excel BPS: %s", errorCode)
+			}
+			return nil, newExcelBPSFallbackError(resp.StatusCode, errorCode, message, upstreamDetail)
 		}
 		return fail(resp.StatusCode, errorCode, message)
 	}

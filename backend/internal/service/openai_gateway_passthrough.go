@@ -2158,7 +2158,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthroughWithImage(
 					trimmedData = strings.TrimSpace(replacedData)
 				}
 			}
-			if from, to, ok := maskUpstreamModelName(account, originalModel, upstreamResponseModelObserverFromContext(c).Model()); ok && strings.Contains(line, from) {
+			if from, to, ok := maskUpstreamModelName(account, originalModel, observedUpstreamModelName(c)); ok && strings.Contains(line, from) {
 				line = s.replaceModelInSSELine(line, from, to)
 				if replacedData, replaced := extractOpenAISSEDataLine(line); replaced {
 					dataBytes = []byte(replacedData)
@@ -2516,7 +2516,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	if originalModel != "" && mappedModel != "" && originalModel != mappedModel {
 		body = s.replaceModelInResponseBody(body, mappedModel, originalModel)
 	}
-	if from, to, ok := maskUpstreamModelName(account, originalModel, upstreamResponseModelObserverFromContext(c).Model()); ok {
+	if from, to, ok := maskUpstreamModelName(account, originalModel, observedUpstreamModelName(c)); ok {
 		body = s.replaceModelInResponseBody(body, from, to)
 	}
 	body, err = restoreOpenAIResponsesNamespacePayload(c, body)
@@ -2581,7 +2581,7 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 		if originalModel != "" && mappedModel != "" && originalModel != mappedModel {
 			body = s.replaceModelInResponseBody(body, mappedModel, originalModel)
 		}
-		if from, to, ok := maskUpstreamModelName(account, originalModel, upstreamResponseModelObserverFromContext(c).Model()); ok {
+		if from, to, ok := maskUpstreamModelName(account, originalModel, observedUpstreamModelName(c)); ok {
 			body = s.replaceModelInResponseBody(body, from, to)
 		}
 		// Correct tool calls in final response
@@ -2596,7 +2596,7 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 		if originalModel != "" && mappedModel != "" && originalModel != mappedModel {
 			bodyText = s.replaceModelInSSEBody(bodyText, mappedModel, originalModel)
 		}
-		if from, to, ok := maskUpstreamModelName(account, originalModel, upstreamResponseModelObserverFromContext(c).Model()); ok {
+		if from, to, ok := maskUpstreamModelName(account, originalModel, observedUpstreamModelName(c)); ok {
 			bodyText = s.replaceModelInSSEBody(bodyText, from, to)
 		}
 		body = []byte(bodyText)

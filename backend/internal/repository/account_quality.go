@@ -193,10 +193,11 @@ func (r *scheduledTestPlanRepository) ApplyQualityOutcome(ctx context.Context, p
 			action = "excel_mode_kept"
 			break
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET extra = jsonb_set(
+		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET extra = jsonb_set(jsonb_set(
 			CASE WHEN extra ? 'openai_excel_bps_models' THEN extra
 			     ELSE jsonb_set(extra, '{openai_excel_bps_models}', '["gpt-6-astra"]'::jsonb, true) END,
-			'{openai_excel_bps}', 'true'::jsonb, true), updated_at=clock_timestamp() WHERE id=$1`, plan.AccountID); err != nil {
+			'{openai_excel_bps}', 'true'::jsonb, true),
+			'{openai_excel_bps_fallback_on_403}', 'true'::jsonb, true), updated_at=clock_timestamp() WHERE id=$1`, plan.AccountID); err != nil {
 			return "", err
 		}
 		state.Action = "excel_mode"

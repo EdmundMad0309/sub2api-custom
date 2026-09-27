@@ -96,7 +96,10 @@ func shouldKeepOpenAIResponsesToolCallNamespaces(
 		return false
 	}
 	if account.IsOpenAIApiKey() {
-		return hasOpenAIResponsesNamespaceToolDeclaration(body) || openAIResponsesInputCarriesToolCallNamespaces(body)
+		// API Key upstreams keep the upstream behavior: only requests that declare a
+		// namespace tool keep namespaces; residual input namespaces are stripped.
+		// The OAuth/Codex path keeps the local fix for Missing namespace errors.
+		return hasOpenAIResponsesNamespaceToolDeclaration(body)
 	}
 	if !account.IsOpenAIOAuthLike() {
 		return false

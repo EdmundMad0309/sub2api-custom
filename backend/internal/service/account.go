@@ -2254,6 +2254,17 @@ func (a *Account) IsExcelBPSAutoDisableOn403Enabled() bool {
 	return enabled
 }
 
+// IsExcelBPSFallbackOn403Enabled 控制 Excel/BPS 返回 403 时是否在同一请求内
+// 回退到标准 Codex 端点（客户端无感）。默认关闭，与上游行为一致；质量运维
+// 的 Excel 模式会给账号自动打开。
+func (a *Account) IsExcelBPSFallbackOn403Enabled() bool {
+	if !a.IsExcelBPSEnabled() {
+		return false
+	}
+	enabled, _ := a.Extra["openai_excel_bps_fallback_on_403"].(bool)
+	return enabled
+}
+
 // isExcelBPSAllModelsEnabled preserves legacy account-wide routing. An explicit
 // list, including an empty or malformed list, never enables BPS for all models.
 func (a *Account) isExcelBPSAllModelsEnabled() bool {

@@ -54,10 +54,6 @@ func excelBPSFallbackCause(err error) *excelBPSFallbackError {
 	return nil
 }
 
-func isExcelBPSFallbackError(err error) bool {
-	return excelBPSFallbackCause(err) != nil
-}
-
 // resetExcelBPSOpsUpstreamError 让回退后的标准 Codex 尝试重新记录自己的上游状态。
 // BPS 那次尝试仍保留在 upstream_errors 数组里，只清空「最后一个上游错误」三项，
 // 避免成功回退的请求被标成 BPS 403。
