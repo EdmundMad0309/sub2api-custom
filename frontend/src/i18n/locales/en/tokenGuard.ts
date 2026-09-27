@@ -29,7 +29,7 @@ export default {
   "notifyOnFix": "Notify on successful repair",
   "notifyOnFail": "Notify on failed repair",
   "reloginAccounts": "Re-login credentials",
-  "reloginAccountsHint": "One per line: email,password,2FA secret. Stored locally and used only for automatic re-login.",
+  "reloginAccountsHint": "One per line: email----password----2FA secret. Stored locally and used only for automatic re-login.",
   "save": "Save configuration",
   "saved": "Configuration saved",
   "unsaved": "Unsaved changes",

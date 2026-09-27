@@ -68,7 +68,7 @@
               </div>
 
               <label class="field-label">{{ t('tokenGuard.reloginAccounts') }}</label>
-              <textarea v-model="reloginText" rows="7" class="input w-full font-mono text-xs" placeholder="user@example.com,password,JBSWY3DPEHPK3PXP"></textarea>
+              <textarea v-model="reloginText" rows="7" class="input w-full font-mono text-xs" placeholder="user@example.com----password----JBSWY3DPEHPK3PXP"></textarea>
               <p class="field-hint">{{ t('tokenGuard.reloginAccountsHint') }}</p>
 
               <div class="grid-2">
@@ -174,10 +174,10 @@ const date = (value: string) => {
 const message = (e: unknown) => (e as { message?: string })?.message || t('qualityOps.error')
 const parseGroupIds = (raw: string) => raw.split(/[,\s;]+/).map(value => Number(value.trim())).filter(value => Number.isFinite(value) && value > 0)
 const parseRelogin = (raw: string) => raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => {
-  const [email = '', password = '', mfa = ''] = line.split(',')
+  const [email = '', password = '', mfa = ''] = line.split('----')
   return { email: email.trim(), password: password.trim(), mfa_secret: mfa.trim() }
 }).filter(item => item.email && item.password)
-const reloginTextOf = (config: TokenGuardConfig | null) => (config?.relogin_accounts ?? []).map(item => `${item.email},${item.password},${item.mfa_secret}`).join('\n')
+const reloginTextOf = (config: TokenGuardConfig | null) => (config?.relogin_accounts ?? []).map(item => `${item.email}----${item.password}----${item.mfa_secret}`).join('\n')
 const parseHeaders = (raw: string) => raw.split(/\r?\n/).reduce<Record<string, string>>((acc, line) => {
   const index = line.indexOf(':')
   if (index > 0) {

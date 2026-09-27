@@ -29,7 +29,7 @@ export default {
   "notifyOnFix": "修复成功推送",
   "notifyOnFail": "修复失败推送",
   "reloginAccounts": "重登凭据",
-  "reloginAccountsHint": "每行一条：邮箱,密码,2FA 密钥。凭据保存在本机设置中，仅用于自动重登。",
+  "reloginAccountsHint": "每行一条：邮箱----密码----2FA 密钥。凭据保存在本机设置中，仅用于自动重登。",
   "save": "保存配置",
   "saved": "配置已保存",
   "unsaved": "有未保存的修改",
