@@ -539,6 +539,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/admin/token-guard-v2', name: 'AdminTokenGuardV2', component: () => import('@/views/admin/ops/TokenGuardV2View.vue'), meta: { requiresAuth: true, requiresAdmin: true, title: 'Credential Operations', titleKey: 'tokenGuardV2.title', descriptionKey: 'tokenGuardV2.description' } },
   { path: '/admin/first-token-monitor', name: 'AdminFirstTokenMonitor', component: () => import('@/views/admin/ops/FirstTokenMonitorView.vue'), meta: { requiresAuth: true, requiresAdmin: true, title: 'First-token monitor', titleKey: 'firstTokenMonitor.title', descriptionKey: 'firstTokenMonitor.description' } },
   { path: '/admin/billing-reconcile', name: 'AdminBillingReconcile', component: () => import('@/views/admin/ops/BillingReconcileView.vue'), meta: { requiresAuth: true, requiresAdmin: true, title: 'Account billing reconciliation', titleKey: 'billingReconcile.title', descriptionKey: 'billingReconcile.description' } },
+  { path: '/admin/upstream-balance', name: 'AdminUpstreamBalance', component: () => import('@/views/admin/ops/UpstreamBalanceView.vue'), meta: { requiresAuth: true, requiresAdmin: true, title: 'Upstream balances', titleKey: 'upstreamBalance.title', descriptionKey: 'upstreamBalance.description' } },
   { path: '/admin/account-ops', name: 'AdminAccountOps', component: () => import('@/views/admin/AccountOpsView.vue'), meta: { requiresAuth: true, requiresAdmin: true, title: 'Account operations', titleKey: 'accountOps.title', descriptionKey: 'accountOps.description' } },
   {
     path: '/admin/account-quality',

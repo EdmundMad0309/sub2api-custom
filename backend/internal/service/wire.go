@@ -961,6 +961,7 @@ var ProviderSet = wire.NewSet(
 	ProvideAccountTokenGuardV2Service,
 	ProvideFirstTokenMonitorService,
 	ProvideBillingReconcileService,
+	ProvideUpstreamPanelBalanceService,
 	NewEmailService,
 	NewNotificationEmailService,
 	ProvideEmailQueueService,

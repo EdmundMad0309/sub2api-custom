@@ -6,6 +6,7 @@ import pelicanTests from './pelicanTests'
 import tokenGuardV2 from './tokenGuardV2'
 import firstTokenMonitor from './firstTokenMonitor'
 import billingReconcile from './billingReconcile'
+import upstreamBalance from './upstreamBalance'
 import landing from './landing'
 import common from './common'
 import dashboard from './dashboard'
@@ -28,6 +29,7 @@ export default {
   tokenGuardV2,
   firstTokenMonitor,
   billingReconcile,
+  upstreamBalance,
   requestTiming,
   ...landing,
   ...common,

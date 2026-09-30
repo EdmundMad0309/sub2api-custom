@@ -50,11 +50,12 @@ SELECT a.id,
        COALESCE(SUM(COALESCE(u.account_stats_cost, u.total_cost) * COALESCE(u.account_rate_multiplier, 1)), 0)::float8,
        COUNT(u.id),
        COALESCE(SUM(u.input_tokens::bigint + u.output_tokens::bigint), 0),
-       COALESCE(a.extra->'upstream_billing_probe'->'balance'->'data'->>'remaining', ''),
-       COALESCE(a.extra->'upstream_billing_probe'->'balance'->'data'->>'wallet_balance', ''),
-       COALESCE(a.extra->'upstream_billing_probe'->'balance'->'data'->>'currency', a.extra->'upstream_billing_probe'->'balance'->'data'->>'wallet_currency', ''),
-       COALESCE(a.extra->'upstream_billing_probe'->'balance'->>'received_at', '')
+       COALESCE(a.extra->'upstream_billing_probe'->'balance'->'data'->>'remaining', p.balance::text, ''),
+       COALESCE(a.extra->'upstream_billing_probe'->'balance'->'data'->>'wallet_balance', p.balance::text, ''),
+       COALESCE(a.extra->'upstream_billing_probe'->'balance'->'data'->>'currency', a.extra->'upstream_billing_probe'->'balance'->'data'->>'wallet_currency', NULLIF(p.balance_unit, ''), ''),
+       COALESCE(a.extra->'upstream_billing_probe'->'balance'->>'received_at', to_char(p.last_probe_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'), '')
 FROM accounts a
+LEFT JOIN account_upstream_panel_credentials p ON p.account_id = a.id
 LEFT JOIN usage_logs u ON u.account_id = a.id
      AND u.created_at >= $1 AND u.created_at < $1 + INTERVAL '1 day'
 WHERE a.deleted_at IS NULL
