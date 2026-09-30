@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// Login jobs keep credentials in bounded, short-lived memory only. They do not
-// enable the guard, modify its settings, or create an account before login succeeds.
+// Login jobs keep token results in bounded, short-lived memory. Successful logins
+// save the supplied password/2FA to the guard without enabling it or creating accounts.
 type OpenAITwoFALoginJob struct {
 	ID         string         `json:"id"`
 	Status     string         `json:"status"`
@@ -30,6 +30,17 @@ func ValidateOpenAITwoFALogin(entry AccountTokenGuardReloginAccount) error {
 }
 
 func (s *AccountTokenGuardService) StartTwoFALogin(ctx context.Context, entry AccountTokenGuardReloginAccount) (*OpenAITwoFALoginJob, error) {
+	return s.startTwoFALogin(ctx, entry, true)
+}
+
+// Operations imports save their login method through the encrypted per-account
+// API after identity deduplication returns the account ID. Do not also enroll
+// them in the legacy guard's plaintext settings.
+func (s *AccountTokenGuardService) StartTwoFALoginForOperations(ctx context.Context, entry AccountTokenGuardReloginAccount) (*OpenAITwoFALoginJob, error) {
+	return s.startTwoFALogin(ctx, entry, false)
+}
+
+func (s *AccountTokenGuardService) startTwoFALogin(ctx context.Context, entry AccountTokenGuardReloginAccount, saveToLegacyGuard bool) (*OpenAITwoFALoginJob, error) {
 	if err := ValidateOpenAITwoFALogin(entry); err != nil {
 		return nil, err
 	}
@@ -68,10 +79,39 @@ func (s *AccountTokenGuardService) StartTwoFALogin(ctx context.Context, entry Ac
 			job.Status = "failed"
 			return
 		}
+		// Persist verified login credentials before the client imports tokens and
+		// clears its password/MFA input. Never report success on a failed save.
+		if saveToLegacyGuard {
+			if err := s.saveTwoFALoginAccount(loginCtx, entry); err != nil {
+				job.Status = "failed"
+				return
+			}
+		}
 		job.Credential = twoFALoginCredential(credential, entry.Email)
 		job.Status = "succeeded"
 	}()
 	return &OpenAITwoFALoginJob{ID: job.ID, Status: job.Status}, nil
+}
+
+// Merge into the latest persisted config, not the snapshot from login start:
+// logins can take minutes, and other imports/config edits may finish meanwhile.
+func (s *AccountTokenGuardService) saveTwoFALoginAccount(ctx context.Context, entry AccountTokenGuardReloginAccount) error {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	cfg, err := s.getConfigLocked(ctx)
+	if err != nil {
+		return err
+	}
+	// GetConfig also caches this slice; do not mutate the published snapshot.
+	accounts := make([]AccountTokenGuardReloginAccount, 0, len(cfg.ReloginAccounts)+1)
+	for _, existing := range cfg.ReloginAccounts {
+		if existing.Email != entry.Email {
+			accounts = append(accounts, existing)
+		}
+	}
+	cfg.ReloginAccounts = append(accounts, entry)
+	_, err = s.saveConfigLocked(ctx, cfg)
+	return err
 }
 
 // Only token/session fields enter the existing Session importer. Discard any

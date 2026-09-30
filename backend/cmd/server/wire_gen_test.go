@@ -91,6 +91,9 @@ func TestProvideCleanup_WithMinimalDependencies_NoPanic(t *testing.T) {
 		nil, // scheduledTestRunner
 		nil, // accountOps
 		nil, // accountTokenGuard
+		nil, // accountTokenGuardV2
+		nil, // firstTokenMonitor
+		nil, // billingReconcile
 		nil, // backupSvc
 		nil, // paymentOrderExpiry
 		nil, // channelMonitorRunner

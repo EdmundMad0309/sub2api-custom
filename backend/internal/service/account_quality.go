@@ -6,6 +6,8 @@ import (
 	"strings"
 )
 
+const QualityActionObserveOnly = "observe_only"
+
 // QualityPolicy is opt-in. Legacy connectivity/HTML tests never modify membership.
 type QualityPolicy struct {
 	Judge          *QualityJudgeConfig `json:"judge,omitempty"`
@@ -13,6 +15,7 @@ type QualityPolicy struct {
 	Action         string              `json:"action"`
 	RemoveGroupIDs []int64             `json:"remove_group_ids"`
 	AutoRestore    bool                `json:"auto_restore"`
+	BPS            *QualityBPSPolicy   `json:"bps,omitempty"`
 	// 判定防抖：连续 N 次同一结论才真正改动账号（默认各 2 次），避免单次抖动反复升降级。
 	FailStreak int `json:"fail_streak,omitempty"`
 	PassStreak int `json:"pass_streak,omitempty"`
@@ -52,8 +55,24 @@ func validateQualityPolicy(plan *ScheduledTestPlan) error {
 	case "excel_mode":
 		// 判定失败时给账号打开 Excel/BPS 模式（保留 6 系白名单不变）；判定通过时关闭。
 	case "disable_scheduling", "record_only":
+	case QualityActionEnableBPS:
+		// 上游：按连续降智次数 / 5h·7d 用量阈值启停 BPS；只有状态探针能绕开 BPS 继续探直连。
+		if plan.PelicanConfig.QuestionKind != OpenAICodexStateProbeQuestionKind {
+			return fmt.Errorf("the enable_bps action requires the state probe question")
+		}
+		if err := validateQualityBPSPolicy(q.BPS); err != nil {
+			return err
+		}
+		q.RemoveGroupIDs = nil
+	case QualityActionObserveOnly:
+		q.AutoRestore = false
+		q.RemoveGroupIDs = nil
+		q.BPS = nil
 	default:
 		return fmt.Errorf("invalid quality action")
+	}
+	if q.Action != QualityActionEnableBPS {
+		q.BPS = nil
 	}
 	if len(q.RemoveGroupIDs) > 100 {
 		return fmt.Errorf("select at most 100 groups")

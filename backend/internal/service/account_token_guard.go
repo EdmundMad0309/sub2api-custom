@@ -12,6 +12,7 @@ import (
 
 	"io"
 	"log/slog"
+	"maps"
 	mrand "math/rand"
 	"net/http"
 	"net/url"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 )
 
 // 智能运维 → 凭证守护：账号令牌巡检 / 自动重登 / 错误态自愈。
@@ -204,25 +206,17 @@ type AccountTokenGuardRepository interface {
 // accountTokenGuardAccounts 是巡检需要的最小账号仓储能力。
 type accountTokenGuardAccounts interface {
 	GetByID(ctx context.Context, id int64) (*Account, error)
-	ListByGroup(ctx context.Context, groupID int64) ([]Account, error)
-	ListByPlatform(ctx context.Context, platform string) ([]Account, error)
+	ListAllWithFilters(ctx context.Context, platform, accountType, status, search string, groupID int64, privacyMode string) ([]Account, error)
 	ClearError(ctx context.Context, id int64) error
 	SetSchedulable(ctx context.Context, id int64, schedulable bool) error
 }
 
-// tokenGuardGroupIncludingErrorLister / tokenGuardPlatformIncludingErrorLister
-// 是可选的增强扫描能力：让守护把 error 态账号也纳入巡检范围。
-// 用类型断言而不是扩展 AccountRepository 大接口，避免为一个放宽动作牵连所有 mock。
-type tokenGuardGroupIncludingErrorLister interface {
-	ListByGroupIncludingError(ctx context.Context, groupID int64) ([]Account, error)
-}
-
-type tokenGuardPlatformIncludingErrorLister interface {
-	ListByPlatformIncludingError(ctx context.Context, platform string) ([]Account, error)
+type accountTokenGuardOperationsAccounts interface {
+	ListCredentialOperationsAccountIDs(ctx context.Context) ([]int64, error)
 }
 
 // accountTokenGuardSeriesRepository 是可选的 6 系兜底能力：读取分组账号视图、
-// 恢复白名单与调度。用类型断言获取，避免未实现该能力的仓储（含上游测试 mock）
+// 恢复白名单与调度。用类型断言获取，避免未实现该能力的仓储（含测试 mock）
 // 被牵连编译失败。
 type accountTokenGuardSeriesRepository interface {
 	ListSeriesAccess(ctx context.Context, groupIDs []int64) ([]AccountTokenGuardSeriesAccount, error)
@@ -257,7 +251,8 @@ type AccountTokenGuardService struct {
 	invalidator TokenCacheInvalidator
 	httpClient  *http.Client
 
-	config atomic.Value
+	configMu sync.Mutex // Serializes config reads, saves and login credential merges.
+	config   atomic.Value
 
 	runMu     sync.Mutex
 	stateMu   sync.Mutex
@@ -466,6 +461,12 @@ func normalizeAccountTokenGuardConfig(c AccountTokenGuardConfig) AccountTokenGua
 }
 
 func (s *AccountTokenGuardService) GetConfig(ctx context.Context) (AccountTokenGuardConfig, error) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	return s.getConfigLocked(ctx)
+}
+
+func (s *AccountTokenGuardService) getConfigLocked(ctx context.Context) (AccountTokenGuardConfig, error) {
 	cfg := defaultAccountTokenGuardConfig()
 	raw, err := s.settings.GetValue(ctx, accountTokenGuardSettingsKey)
 	if err != nil && !errors.Is(err, ErrSettingNotFound) {
@@ -485,6 +486,12 @@ func (s *AccountTokenGuardService) GetConfig(ctx context.Context) (AccountTokenG
 }
 
 func (s *AccountTokenGuardService) SaveConfig(ctx context.Context, cfg AccountTokenGuardConfig) (AccountTokenGuardConfig, error) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	return s.saveConfigLocked(ctx, cfg)
+}
+
+func (s *AccountTokenGuardService) saveConfigLocked(ctx context.Context, cfg AccountTokenGuardConfig) (AccountTokenGuardConfig, error) {
 	cfg = normalizeAccountTokenGuardConfig(cfg)
 	if err := ValidateAccountTokenGuardConfig(cfg); err != nil {
 		return cfg, err
@@ -666,6 +673,17 @@ func (s *AccountTokenGuardService) Status(ctx context.Context) (AccountTokenGuar
 	if err != nil {
 		return AccountTokenGuardStatus{}, err
 	}
+	managed, err := s.credentialOperationsAccounts(ctx)
+	if err != nil {
+		return AccountTokenGuardStatus{}, err
+	}
+	visible := states[:0]
+	for _, state := range states {
+		if !managed[state.AccountID] {
+			visible = append(visible, state)
+		}
+	}
+	states = visible
 	events, err := s.repo.ListEvents(ctx, 0, 100)
 	if err != nil {
 		return AccountTokenGuardStatus{}, err
@@ -751,6 +769,9 @@ func (s *AccountTokenGuardService) runCycle(ctx context.Context, manual bool, jo
 		return s.currentStats(), err
 	}
 	s.updateJobTotal(jobID, len(accounts))
+	// Snapshot before progress upserts: those must not erase the previous
+	// cycle's failure streak before the recovery threshold is evaluated.
+	existing := s.statesMap(cycleCtx)
 	results := make([]AccountTokenGuardProbeResult, len(accounts))
 	semaphore := make(chan struct{}, cfg.ProbeConcurrency)
 	var wg sync.WaitGroup
@@ -766,12 +787,16 @@ func (s *AccountTokenGuardService) runCycle(ctx context.Context, manual bool, jo
 			// 探活完成即刻落库，页面无需等整轮结束即可看到进度。
 			now := time.Now()
 			storeCtx, storeCancel := newGuardStoreContext()
-			_ = s.repo.UpsertState(storeCtx, AccountTokenGuardState{
-				AccountID: accounts[position].ID, AccountName: accounts[position].Name,
-				AccountStatus: accounts[position].Status, Schedulable: accounts[position].Schedulable,
-				ProbeState: result.State, ProbeDetail: result.Detail, LatencyMS: result.LatencyMS,
-				LastProbeAt: &now, UpdatedAt: now,
-			})
+			// Do not replay historical fix fields: the repository preserves the
+			// latest manual repair when progress has no LastFixAt of its own.
+			state := AccountTokenGuardState{FailStreak: existing[accounts[position].ID].FailStreak}
+			state.AccountID = accounts[position].ID
+			state.AccountName = accounts[position].Name
+			state.AccountStatus = accounts[position].Status
+			state.Schedulable = accounts[position].Schedulable
+			state.ProbeState, state.ProbeDetail, state.LatencyMS = result.State, result.Detail, result.LatencyMS
+			state.LastProbeAt, state.UpdatedAt = &now, now
+			_ = s.repo.UpsertState(storeCtx, state)
 			storeCancel()
 			s.updateJobProgress(jobID)
 		}(index)
@@ -783,8 +808,11 @@ func (s *AccountTokenGuardService) runCycle(ctx context.Context, manual bool, jo
 
 	stats := AccountTokenGuardStats{Probed: len(accounts), StartedAt: started.Unix()}
 	states := make([]AccountTokenGuardState, 0, len(accounts))
-	existing := s.statesMap(cycleCtx)
+	existing = s.statesMap(cycleCtx)
 	for index := range accounts {
+		if runParent.Err() != nil {
+			break
+		}
 		account := &accounts[index]
 		result := results[index]
 		state := AccountTokenGuardState{AccountID: account.ID, AccountName: account.Name, AccountStatus: account.Status, Schedulable: account.Schedulable}
@@ -806,11 +834,15 @@ func (s *AccountTokenGuardService) runCycle(ctx context.Context, manual bool, jo
 			stats.Healthy++
 			state.FailStreak = 0
 			if account.Status == StatusError {
-				if s.recoverState(cycleCtx, account, cfg) {
+				fixCtx, cancelFix := context.WithTimeout(runParent, time.Minute)
+				recovered := s.recoverState(fixCtx, account, cfg)
+				cancelFix()
+				if recovered {
 					stats.StateFixed++
 					state.LastFixAt = &now
 					state.LastFixAction = "状态自愈"
 					state.LastFixResult = "清除错误态并恢复调度"
+					markGuardStateRecovered(&state, cfg)
 					s.recordEvent(cycleCtx, account, AccountTokenGuardEventStateFixed, "探活正常但账号处于 error 态，已清除错误并恢复调度", result.LatencyMS)
 					s.notify(cfg, "凭证守护：已恢复账号调度", fmt.Sprintf("%s(#%d) 令牌有效但被禁用，已自动恢复调度", account.Name, account.ID), cfg.NotifyOnFix)
 				} else {
@@ -827,7 +859,11 @@ func (s *AccountTokenGuardService) runCycle(ctx context.Context, manual bool, jo
 			state.FailStreak++
 			s.recordEvent(cycleCtx, account, AccountTokenGuardEventProbeAuth, result.Detail, result.LatencyMS)
 			if state.FailStreak >= cfg.FailStreakThreshold && cfg.AutoRelogin {
-				action, fixErr := s.reloginAccount(cycleCtx, cfg, account)
+				// Login may take much longer than probing. Give each repair its
+				// own budget, while retaining job cancellation and service Stop.
+				fixCtx, cancelFix := context.WithTimeout(runParent, 25*time.Minute)
+				action, fixErr := s.reloginAccount(fixCtx, cfg, account)
+				cancelFix()
 				if fixErr != nil {
 					stats.Failed++
 					state.LastFixAt = &now
@@ -841,6 +877,9 @@ func (s *AccountTokenGuardService) runCycle(ctx context.Context, manual bool, jo
 					state.LastFixAt = &now
 					state.LastFixAction = "自动重登"
 					state.LastFixResult = action
+					state.ProbeState = AccountTokenGuardProbeOK
+					state.ProbeDetail = `{"code":"relogin_ok"}`
+					markGuardStateRecovered(&state, cfg)
 					s.recordEvent(cycleCtx, account, AccountTokenGuardEventReloginOK, action, 0)
 					s.notify(cfg, "凭证守护：已自动重登", fmt.Sprintf("%s(#%d) 已重登并恢复调度", account.Name, account.ID), cfg.NotifyOnFix)
 				}
@@ -869,6 +908,9 @@ func (s *AccountTokenGuardService) runCycle(ctx context.Context, manual bool, jo
 	}
 	s.ensureSeriesCapacity(ctx, cfg, manual)
 	s.finishCycle(started, stats, message)
+	if err := runParent.Err(); err != nil {
+		return stats, err
+	}
 	slog.Info("account_token_guard_cycle_done", "probed", stats.Probed, "healthy", stats.Healthy,
 		"auth_failed", stats.AuthFailed, "repaired", stats.Repaired, "state_fixed", stats.StateFixed)
 	return stats, nil
@@ -911,41 +953,29 @@ func (s *AccountTokenGuardService) finishCycle(started time.Time, stats AccountT
 }
 
 func (s *AccountTokenGuardService) listAccounts(ctx context.Context, cfg AccountTokenGuardConfig) ([]Account, error) {
+	managed, err := s.credentialOperationsAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
 	seen := map[int64]bool{}
 	out := make([]Account, 0, 32)
 	appendAccount := func(account Account) {
-		if seen[account.ID] || !account.IsOAuth() || account.Platform != PlatformOpenAI || account.IsShadow() {
+		if seen[account.ID] || managed[account.ID] || !account.IsOAuth() || account.Platform != PlatformOpenAI || account.IsShadow() ||
+			(account.Status != StatusActive && account.Status != StatusError) {
 			return
 		}
 		seen[account.ID] = true
 		out = append(out, account)
 	}
-	if len(cfg.GroupIDs) > 0 {
-		for _, groupID := range cfg.GroupIDs {
-			// 优先使用「含 error 态」的扫描：令牌失效的账号会被标成 error，
-			// 只扫 active 会让守护永远看不到需要重登的号。
-			var items []Account
-			var err error
-			if lister, ok := s.accounts.(tokenGuardGroupIncludingErrorLister); ok {
-				items, err = lister.ListByGroupIncludingError(ctx, groupID)
-			} else {
-				items, err = s.accounts.ListByGroup(ctx, groupID)
-			}
-			if err != nil {
-				return nil, err
-			}
-			for _, account := range items {
-				appendAccount(account)
-			}
-		}
-	} else {
-		var items []Account
-		var err error
-		if lister, ok := s.accounts.(tokenGuardPlatformIncludingErrorLister); ok {
-			items, err = lister.ListByPlatformIncludingError(ctx, PlatformOpenAI)
-		} else {
-			items, err = s.accounts.ListByPlatform(ctx, PlatformOpenAI)
-		}
+	groupIDs := cfg.GroupIDs
+	if len(groupIDs) == 0 {
+		groupIDs = []int64{0}
+	}
+	for _, groupID := range groupIDs {
+		// Scheduling queries only return active accounts. The admin query
+		// includes errors; filter disabled accounts above. Leave status empty
+		// because its "active" filter also excludes paused/cooled accounts.
+		items, err := s.accounts.ListAllWithFilters(ctx, PlatformOpenAI, "", "", "", groupID, "")
 		if err != nil {
 			return nil, err
 		}
@@ -1048,6 +1078,13 @@ func newGuardStoreContext() (context.Context, context.CancelFunc) {
 
 // ReloginAccount 供页面手动触发单个账号重登。
 func (s *AccountTokenGuardService) ReloginAccount(ctx context.Context, accountID int64) (string, error) {
+	managed, err := s.credentialOperationsAccounts(ctx)
+	if err != nil {
+		return "", err
+	}
+	if managed[accountID] {
+		return "", errors.New("账号已加入凭证运营，请在凭证运营中重登")
+	}
 	cfg := s.currentConfig()
 	account, err := s.accounts.GetByID(ctx, accountID)
 	if err != nil || account == nil {
@@ -1072,9 +1109,33 @@ func (s *AccountTokenGuardService) ReloginAccount(ctx context.Context, accountID
 	state.ProbeState = AccountTokenGuardProbeOK
 	state.ProbeDetail = "手动重登成功"
 	state.LastFixResult = action
+	markGuardStateRecovered(&state, cfg)
 	_ = s.repo.UpsertState(ctx, state)
 	s.recordEvent(ctx, account, AccountTokenGuardEventReloginOK, "手动重登: "+action, 0)
 	return action, nil
+}
+
+func (s *AccountTokenGuardService) credentialOperationsAccounts(ctx context.Context) (map[int64]bool, error) {
+	managed := make(map[int64]bool)
+	reader, ok := s.accounts.(accountTokenGuardOperationsAccounts)
+	if !ok {
+		return managed, nil
+	}
+	ids, err := reader.ListCredentialOperationsAccountIDs(ctx)
+	if err != nil {
+		return nil, errors.New("无法读取凭证运营账号范围，已暂停旧守护操作")
+	}
+	for _, id := range ids {
+		managed[id] = true
+	}
+	return managed, nil
+}
+
+func markGuardStateRecovered(state *AccountTokenGuardState, cfg AccountTokenGuardConfig) {
+	state.AccountStatus = StatusActive
+	if cfg.RestoreSchedulable {
+		state.Schedulable = true
+	}
 }
 
 func (s *AccountTokenGuardService) recoverState(ctx context.Context, account *Account, cfg AccountTokenGuardConfig) bool {
@@ -1112,7 +1173,14 @@ func (s *AccountTokenGuardService) reloginAccount(ctx context.Context, cfg Accou
 	for key, value := range credential {
 		payload[key] = value
 	}
-	if _, err := s.admin.UpdateAccount(ctx, account.ID, &UpdateAccountInput{Credentials: payload}); err != nil {
+	input := &UpdateAccountInput{Credentials: payload}
+	if strings.EqualFold(guardText(credential["plan_type"]), "free") && account.Extra["openai_excel_bps"] == true {
+		// Free accounts cannot use BPS. Disable the old flag in the same write
+		// so account validation does not reject the refreshed credentials.
+		input.Extra = maps.Clone(account.Extra)
+		input.Extra["openai_excel_bps"] = false
+	}
+	if _, err := s.admin.UpdateAccount(ctx, account.ID, input); err != nil {
 		return "自动重登", fmt.Errorf("写回凭据失败: %w", err)
 	}
 	action := "重登并写回新凭据"
@@ -1150,48 +1218,17 @@ func findGuardReloginAccount(cfg AccountTokenGuardConfig, accountName string) (A
 	return AccountTokenGuardReloginAccount{}, false
 }
 
-// probe 选择探活方式：默认直连上游（我们自己的链路），显式配置 endpoint 时才走第三方探活。
 func (s *AccountTokenGuardService) probe(ctx context.Context, cfg AccountTokenGuardConfig, account *Account) AccountTokenGuardProbeResult {
-	// 默认保持上游行为（ProbeEndpoint 探活）；仅当显式选择 upstream 模式时，
-	// 才改用直连上游 wham/usage 的自建探活。
+	// A probe provider's own 429, 401 or outage must not prevent recovery
+	// when a business request already established that this token was revoked.
+	if guardAccountHasAuthFailure(account) {
+		diagnostic := AccountTokenGuardDiagnostic{Code: "account_auth_rejected"}
+		return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeAuth, Detail: formatGuardDiagnostic(diagnostic), Diagnostic: diagnostic}
+	}
+	// 本地增强：显式选择 upstream 模式时，直连上游 wham/usage 探活，不依赖第三方探活服务。
 	if strings.EqualFold(strings.TrimSpace(cfg.ProbeMode), AccountTokenGuardProbeModeUpstream) {
 		return s.probeUpstream(ctx, account)
 	}
-	return s.probeEndpoint(ctx, cfg, account)
-}
-
-// probeUpstream 直连上游 /backend-api/wham/usage 验证凭据：
-// 成功 = 令牌可用（顺带刷新一次账号用量快照）；401/鉴权类错误 = 令牌失效（可触发重登）；
-// 其它错误（网络、限流、5xx）= 临时异常，不动账号。
-func (s *AccountTokenGuardService) probeUpstream(ctx context.Context, account *Account) AccountTokenGuardProbeResult {
-	if s == nil || s.quotaProbe == nil {
-		return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeTransient, Detail: "直连探活未装配"}
-	}
-	started := time.Now()
-	probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	_, err := s.quotaProbe.QueryUsage(probeCtx, account.ID)
-	latency := int(time.Since(started).Milliseconds())
-	if err == nil {
-		return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeOK, Detail: fmt.Sprintf("直连上游正常 %dms", latency), LatencyMS: latency}
-	}
-	status := 0
-	var appErr *infraerrors.ApplicationError
-	if errors.As(err, &appErr) && appErr != nil {
-		status = int(appErr.Code)
-	}
-	message := strings.ToLower(err.Error())
-	authLike := status == http.StatusUnauthorized ||
-		strings.Contains(message, "auth_failed") ||
-		containsGuardAny(message, []string{"invalidated oauth token", "token revoked", "invalid_grant", "oauth token failure", "requires_relogin"})
-	if authLike {
-		return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeAuth, Detail: truncateGuardText(err.Error(), 160), LatencyMS: latency}
-	}
-	return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeTransient, Detail: truncateGuardText(err.Error(), 160), LatencyMS: latency}
-}
-
-// probeEndpoint 用账号当前的 access_token 调第三方测活接口（旧模式）。
-func (s *AccountTokenGuardService) probeEndpoint(ctx context.Context, cfg AccountTokenGuardConfig, account *Account) AccountTokenGuardProbeResult {
 	token := strings.TrimSpace(account.GetCredential("access_token"))
 	if token == "" {
 		return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeAuth, Detail: `{"code":"missing_access_token"}`, Diagnostic: AccountTokenGuardDiagnostic{Code: "missing_access_token"}}
@@ -1253,6 +1290,58 @@ func (s *AccountTokenGuardService) probeEndpoint(ctx context.Context, cfg Accoun
 	return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeTransient, Detail: formatGuardDiagnostic(diagnostic), LatencyMS: latency, Diagnostic: diagnostic}
 }
 
+// probeUpstream 直连上游 /backend-api/wham/usage 验证凭据：
+// 成功 = 令牌可用（顺带刷新一次账号用量快照）；401/鉴权类错误 = 令牌失效（可触发重登）；
+// 其它错误（网络、限流、5xx）= 临时异常，不动账号。
+func (s *AccountTokenGuardService) probeUpstream(ctx context.Context, account *Account) AccountTokenGuardProbeResult {
+	if s == nil || s.quotaProbe == nil {
+		return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeTransient, Detail: "直连探活未装配"}
+	}
+	started := time.Now()
+	probeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	_, err := s.quotaProbe.QueryUsage(probeCtx, account.ID)
+	latency := int(time.Since(started).Milliseconds())
+	if err == nil {
+		return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeOK, Detail: fmt.Sprintf("直连上游正常 %dms", latency), LatencyMS: latency}
+	}
+	status := 0
+	var appErr *infraerrors.ApplicationError
+	if errors.As(err, &appErr) && appErr != nil {
+		status = int(appErr.Code)
+	}
+	message := strings.ToLower(err.Error())
+	authLike := status == http.StatusUnauthorized ||
+		strings.Contains(message, "auth_failed") ||
+		containsGuardAny(message, []string{"invalidated oauth token", "token revoked", "invalid_grant", "oauth token failure", "requires_relogin"})
+	if authLike {
+		return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeAuth, Detail: truncateGuardText(err.Error(), 160), LatencyMS: latency}
+	}
+	return AccountTokenGuardProbeResult{State: AccountTokenGuardProbeTransient, Detail: truncateGuardText(err.Error(), 160), LatencyMS: latency}
+}
+
+func guardAccountHasAuthFailure(account *Account) bool {
+	if account.Platform != PlatformOpenAI || !account.IsOAuth() || account.Status != StatusError {
+		return false
+	}
+	if strings.HasPrefix(account.ErrorMessage, "Token revoked (401):") ||
+		strings.HasPrefix(account.ErrorMessage, "Unauthorized (401):") {
+		return true
+	}
+	// The account test path persists the structured upstream body under this
+	// prefix. Require an explicit auth code, never a substring in its message.
+	raw, ok := strings.CutPrefix(account.ErrorMessage, "Authentication failed (401):")
+	if !ok {
+		return false
+	}
+	var result struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	return json.Unmarshal([]byte(raw), &result) == nil && isGuardAuthCode(result.Error.Code)
+}
+
 func (s *AccountTokenGuardService) relogin(ctx context.Context, cfg AccountTokenGuardConfig, entry AccountTokenGuardReloginAccount) (map[string]any, error) {
 	payload := map[string]any{
 		"action":     "start",
@@ -1287,6 +1376,15 @@ func (s *AccountTokenGuardService) relogin(ctx context.Context, cfg AccountToken
 	if credential, ok := result["credential"].(map[string]any); ok {
 		if guardText(credential["access_token"]) == "" || guardText(credential["refresh_token"]) == "" || guardText(credential["id_token"]) == "" {
 			return nil, errors.New("重登返回的凭据不完整")
+		}
+		// Re-login providers may return only tokens, leaving the stored plan_type
+		// stale when credentials are merged. As in the normal OAuth flow, prefer
+		// the new ID token's explicit plan (including Free) over provider metadata.
+		// Missing/unparseable claims must not turn an unknown plan into Free.
+		if claims, err := openai.ParseIDToken(guardText(credential["id_token"])); err == nil {
+			if plan := strings.TrimSpace(claims.GetUserInfo().PlanType); plan != "" {
+				credential["plan_type"] = plan
+			}
 		}
 		return credential, nil
 	}
@@ -1576,7 +1674,8 @@ func guardReadErrorCode(err error) string {
 
 func isGuardAuthCode(code string) bool {
 	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "auth_failed", "invalid_token", "token_invalid", "requires_relogin", "invalid_grant", "revoked":
+	case "auth_failed", "invalid_token", "token_invalid", "requires_relogin", "invalid_grant", "revoked",
+		"token_invalidated", "token_revoked", "refresh_token_reused", "refresh_token_invalidated":
 		return true
 	default:
 		return false

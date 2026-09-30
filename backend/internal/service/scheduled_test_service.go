@@ -13,10 +13,9 @@ var scheduledTestCronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom 
 
 // ScheduledTestService provides CRUD operations for scheduled test plans and results.
 type ScheduledTestService struct {
-	planRepo   ScheduledTestPlanRepository
-	resultRepo ScheduledTestResultRepository
-	// showcase copies successful Pelican HTML results to the user gallery; nil disables it.
-	showcase *PelicanShowcaseService
+	planRepo     ScheduledTestPlanRepository
+	resultRepo   ScheduledTestResultRepository
+	templateRepo QualityRuleTemplateRepository
 }
 
 // NewScheduledTestService creates a new ScheduledTestService.
@@ -79,14 +78,13 @@ func (s *ScheduledTestService) ListResults(ctx context.Context, planID int64, li
 	return s.resultRepo.ListByPlanID(ctx, planID, limit, includeContent...)
 }
 
-// SaveResult inserts a result and prunes old entries beyond maxResults.
+// SaveResult inserts a result and prunes old entries beyond maxResults. Account plans
+// only feed the admin history; the user showcase is fed by group tests.
 func (s *ScheduledTestService) SaveResult(ctx context.Context, planID int64, maxResults int, result *ScheduledTestResult) error {
 	result.PlanID = planID
-	saved, err := s.resultRepo.Create(ctx, result)
-	if err != nil {
+	if _, err := s.resultRepo.Create(ctx, result); err != nil {
 		return err
 	}
-	s.showcase.PublishScheduledResult(ctx, saved)
 	return s.resultRepo.PruneOldResults(ctx, planID, maxResults)
 }
 
@@ -100,6 +98,12 @@ func computeNextRun(cronExpr string, from time.Time) (time.Time, error) {
 
 func nextPlanRun(plan *ScheduledTestPlan, now time.Time) (time.Time, error) {
 	if cfg := plan.PelicanConfig; cfg != nil {
+		if cfg.TestChannel != "" && cfg.TestChannel != "account" && cfg.TestChannel != "bps" {
+			return time.Time{}, fmt.Errorf("invalid test channel")
+		}
+		if cfg.TestChannel == "bps" && (cfg.QuestionKind != "candy" || cfg.Quality == nil || cfg.Quality.Action != QualityActionObserveOnly) {
+			return time.Time{}, fmt.Errorf("BPS channel tests require a candy question and observation-only policy")
+		}
 		// 探针题型不需要题目文本；其余题型题目必填。
 		if isOpenAICodexStateProbePlan(cfg) {
 			if len(cfg.Prompt) > 32000 || strings.TrimSpace(plan.ModelID) == "" || len(plan.ModelID) > 100 {
