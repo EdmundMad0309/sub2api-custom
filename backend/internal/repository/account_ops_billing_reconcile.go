@@ -59,7 +59,7 @@ LEFT JOIN account_upstream_panel_credentials p ON p.account_id = a.id
 LEFT JOIN usage_logs u ON u.account_id = a.id
      AND u.created_at >= $1 AND u.created_at < $1 + INTERVAL '1 day'
 WHERE a.deleted_at IS NULL
-GROUP BY a.id
+GROUP BY a.id, p.balance, p.balance_unit, p.last_probe_at
 ORDER BY a.id`, day)
 	if err != nil {
 		return nil, err
