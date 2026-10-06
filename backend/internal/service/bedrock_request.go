@@ -807,21 +807,6 @@ func sanitizeBedrockCCFields(body []byte) []byte {
 	if gjson.GetBytes(body, "fallback_credit_token").Exists() {
 		body, _ = sjson.DeleteBytes(body, "fallback_credit_token")
 	}
-	// Bedrock Invoke 不接受结构化输出字段：
-	//   output_config.format（Claude API 新形态）—— 直接删除；若 output_config 变空则整体删除，
-	//   其余子字段（如 effort）保留，避免影响推理强度控制。
-	//   output_format（旧形态）—— 沿用 Bedrock 直连路径的做法，把 schema 内联到末条 user 消息后删除。
-	if gjson.GetBytes(body, "output_config.format").Exists() {
-		body, _ = sjson.DeleteBytes(body, "output_config.format")
-		if cfg := gjson.GetBytes(body, "output_config"); cfg.Exists() && cfg.IsObject() && len(cfg.Map()) == 0 {
-			body, _ = sjson.DeleteBytes(body, "output_config")
-		}
-		logger.LegacyPrintf("service.gateway", "[Bedrock CC Compat] Removed output_config.format (unsupported by Bedrock)")
-	}
-	if gjson.GetBytes(body, "output_format").Exists() {
-		body = convertOutputFormatToInlineSchema(body)
-		logger.LegacyPrintf("service.gateway", "[Bedrock CC Compat] Converted output_format to inline schema")
-	}
 	if !gjson.GetBytes(body, "max_tokens").Exists() {
 		body, _ = sjson.SetBytes(body, "max_tokens", defaultCCMaxTokens)
 	}

@@ -16,7 +16,6 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
-	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
 
@@ -188,12 +187,6 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	// 字段，上游 400 "The `reasoning_content` in the thinking mode must be
 	// passed back to the API"。在共用出站点补空格占位，真实明文不覆盖。
 	body = ensureDeepSeekChatReasoningPlaceholders(account, body)
-	// reasoning-first 上游对 sampling 参数会直接 400，统一出口兜底剥离。
-	if model := strings.TrimSpace(gjson.GetBytes(body, "model").String()); model != "" {
-		if normalized, changed, normalizeErr := normalizeOpenAIUnsupportedReasoningSamplingParams(body, model); normalizeErr == nil && changed {
-			body = normalized
-		}
-	}
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, targetURL, bytes.NewReader(body))
 	releaseUpstreamCtx()

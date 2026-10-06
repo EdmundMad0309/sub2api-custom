@@ -2595,34 +2595,3 @@ func supportsOpenAIReasoningEffortMax(model string) bool {
 		return false
 	}
 }
-
-// normalizeOpenAIUnsupportedReasoningSamplingParams removes temperature/top_p
-// and other sampling params for reasoning-first model families whose upstream
-// rejects them with "Unsupported parameter: 'temperature' is not supported with this model".
-func normalizeOpenAIUnsupportedReasoningSamplingParams(body []byte, model string) ([]byte, bool, error) {
-	name := strings.ToLower(strings.TrimSpace(model))
-	if name == "" {
-		return body, false, nil
-	}
-	switch {
-	case strings.HasPrefix(name, "gpt-5"), strings.HasPrefix(name, "gpt-6"),
-		strings.HasPrefix(name, "o1"), strings.HasPrefix(name, "o3"),
-		strings.HasPrefix(name, "o4"), strings.HasPrefix(name, "codex"):
-	default:
-		return body, false, nil
-	}
-	out := body
-	changed := false
-	for _, key := range []string{"temperature", "top_p", "frequency_penalty", "presence_penalty", "logit_bias", "logprobs", "top_logprobs"} {
-		if !gjson.GetBytes(out, key).Exists() {
-			continue
-		}
-		next, err := sjson.DeleteBytes(out, key)
-		if err != nil {
-			return body, false, fmt.Errorf("strip %s for reasoning model: %w", key, err)
-		}
-		out = next
-		changed = true
-	}
-	return out, changed, nil
-}
