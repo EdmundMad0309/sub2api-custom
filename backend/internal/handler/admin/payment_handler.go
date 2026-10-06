@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"net/http"
 	"strconv"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 type PaymentHandler struct {
 	paymentService *service.PaymentService
 	configService  *service.PaymentConfigService
+	barkNotify     *service.PaymentBarkNotifyService
 }
 
 // NewPaymentHandler creates a new admin PaymentHandler.
@@ -125,6 +127,7 @@ type AdminPaymentOrderResult struct {
 	Amount              float64    `json:"amount"`
 	PayAmount           float64    `json:"pay_amount"`
 	FeeRate             float64    `json:"fee_rate"`
+	BonusAmount         float64    `json:"bonus_amount"`
 	Currency            string     `json:"currency"`
 	RechargeCode        string     `json:"recharge_code,omitempty"`
 	OutTradeNo          string     `json:"out_trade_no"`
@@ -182,6 +185,7 @@ func sanitizeAdminPaymentOrderForResponse(order *dbent.PaymentOrder) *AdminPayme
 		Amount:              order.Amount,
 		PayAmount:           order.PayAmount,
 		FeeRate:             order.FeeRate,
+		BonusAmount:         order.BonusAmount,
 		Currency:            service.PaymentOrderCurrency(order),
 		RechargeCode:        order.RechargeCode,
 		OutTradeNo:          order.OutTradeNo,
@@ -500,4 +504,55 @@ func (h *PaymentHandler) UpdateConfig(c *gin.Context) {
 		return
 	}
 	response.Success(c, gin.H{"message": "updated"})
+}
+
+// SetBarkNotifyService 注入「订单交易成功」Bark 推送服务。
+func (h *PaymentHandler) SetBarkNotifyService(barkNotify *service.PaymentBarkNotifyService) {
+	if h == nil {
+		return
+	}
+	h.barkNotify = barkNotify
+}
+
+// GetBarkNotifyConfig 返回订单成交通知配置。
+// GET /api/v1/admin/payment/bark-notify
+func (h *PaymentHandler) GetBarkNotifyConfig(c *gin.Context) {
+	if h == nil || h.barkNotify == nil {
+		response.Error(c, http.StatusServiceUnavailable, "payment bark notify service unavailable")
+		return
+	}
+	response.Success(c, h.barkNotify.GetConfig())
+}
+
+// UpdateBarkNotifyConfig 保存订单成交通知配置。
+// PUT /api/v1/admin/payment/bark-notify
+func (h *PaymentHandler) UpdateBarkNotifyConfig(c *gin.Context) {
+	if h == nil || h.barkNotify == nil {
+		response.Error(c, http.StatusServiceUnavailable, "payment bark notify service unavailable")
+		return
+	}
+	var cfg service.PaymentBarkNotifyConfig
+	if err := c.ShouldBindJSON(&cfg); err != nil {
+		response.BadRequest(c, "invalid request: "+err.Error())
+		return
+	}
+	if err := h.barkNotify.SaveConfig(c.Request.Context(), cfg); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.Success(c, h.barkNotify.GetConfig())
+}
+
+// TestBarkNotify 发送一条测试推送。
+// POST /api/v1/admin/payment/bark-notify/test
+func (h *PaymentHandler) TestBarkNotify(c *gin.Context) {
+	if h == nil || h.barkNotify == nil {
+		response.Error(c, http.StatusServiceUnavailable, "payment bark notify service unavailable")
+		return
+	}
+	if err := h.barkNotify.SendTest(c.Request.Context()); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.Success(c, gin.H{"sent": true})
 }

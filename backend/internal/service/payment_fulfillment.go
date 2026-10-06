@@ -430,7 +430,14 @@ func (s *PaymentService) markCompleted(ctx context.Context, o *dbent.PaymentOrde
 }
 
 func (s *PaymentService) dispatchPaymentFulfillmentNotification(o *dbent.PaymentOrder, auditAction string) {
-	if s == nil || s.notificationEmailService == nil || o == nil {
+	if s == nil || o == nil {
+		return
+	}
+	// 订单成交通知（Bark）：与邮件通知共用同一幂等入口，每笔订单只推一次。
+	if s.barkNotify != nil {
+		s.barkNotify.NotifyOrderFulfilled(o, auditAction)
+	}
+	if s.notificationEmailService == nil {
 		return
 	}
 	go func() {
@@ -741,7 +748,10 @@ func affiliateRebateBaseAmount(o *dbent.PaymentOrder) float64 {
 		return 0
 	}
 	switch o.OrderType {
-	case payment.OrderTypeBalance, payment.OrderTypeSubscription:
+	case payment.OrderTypeBalance:
+		// 返利只按实充部分计算，赠送额度不参与
+		return paymentOrderAmountWithoutBonus(o)
+	case payment.OrderTypeSubscription:
 		return o.Amount
 	default:
 		return 0

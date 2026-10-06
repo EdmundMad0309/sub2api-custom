@@ -1,5 +1,8 @@
 import { apiClient } from '../client'
 export interface PrioritySchedulingConfig {
+  oauth_quota_priority?: boolean
+  oauth_quota_threshold?: number
+  balance_protocols?: boolean
   enabled: boolean
   mode: 'experience' | 'balanced' | 'profit' | 'custom'
   group_ids: number[]
@@ -15,7 +18,14 @@ export interface PrioritySchedulingConfig {
   load_weight: number
   cost_weight: number
 }
+export type PriorityHistoryStatus = 'ready' | 'stale' | 'partial' | 'loading' | 'error' | 'unavailable' | 'limited'
 export interface PriorityCandidate {
+  oauth_quota_role?: 'preferred' | 'standby'
+  history_status?: PriorityHistoryStatus
+  capacity_band?: number
+  selection_weight?: number
+  exploration_eligible?: boolean
+  bound_groups?: number
   profit: number | null
   margin: number | null
   economics_source: 'usage' | 'rate' | 'unknown'
@@ -39,6 +49,12 @@ export interface PriorityCandidate {
   quality_samples: number
 }
 export interface PrioritySnapshot {
+  evaluated_at?: string
+  history_status?: PriorityHistoryStatus
+  history_observed_at?: string
+  history_error?: string
+  history_refreshing?: boolean
+  selection_policy?: string
   at: string
   model: string
   group_id: number | null

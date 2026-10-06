@@ -1,3 +1,9 @@
+# Process role: full retains the dashboard and global background jobs (default).
+# gateway exposes model gateway APIs only and keeps request-local workers running.
+# Keep exactly one full instance until every enabled global job has a shared lease.
+runtime:
+  role: "full"
+
 # Sub2API Configuration File
 # Sub2API 配置文件
 #
@@ -11,6 +17,14 @@
 # 服务器配置
 # =============================================================================
 server:
+  # Shared PostgreSQL/Redis readiness budget: 0 = 1s (default), allowed 1..60s.
+  # If changed, Kubernetes readinessProbe.timeoutSeconds must exceed this budget.
+  readiness_timeout_seconds: 0
+  # HTTP/WS request drain budget after load-balancer withdrawal (seconds).
+  # Default 5 preserves existing deployments; Kubernetes example uses 240.
+  graceful_shutdown_timeout: 5
+  # Fail readiness/reject new work, then wait for endpoint propagation.
+  shutdown_drain_delay: 0
   # Bind address (0.0.0.0 for all interfaces)
   # 绑定地址（0.0.0.0 表示监听所有网络接口）
   host: "0.0.0.0"
@@ -217,6 +231,24 @@ security:
 # 网关配置
 # =============================================================================
 gateway:
+  # Route upstream hosts through operator-managed regional HTTP(S)/SOCKS5 exits.
+  # Disabled by default; reload requires a process restart. Explicit account
+  # proxies, Codex harvest proxies and BPS keep their existing exit policy.
+  upstream_routing:
+    enabled: false
+    regions: []
+    rules: []
+    # regions:
+    #   - id: us
+    #     proxy_url_env: SUB2API_EGRESS_US_PROXY_URL
+    # rules:
+    #   - domain: api.vendor.example
+    #     region: us
+    #     account_ids: [123] # optional upstream account IDs, not client API Key IDs
+    #   - domain: "*.us.vendor.example"
+    #     region: us
+    # Inject SUB2API_EGRESS_US_PROXY_URL via Secret/EnvironmentFile, for example
+    # socks5h://127.0.0.1:11080 (SSH SOCKS tunnel terminating on a US host).
   # Timeout for waiting upstream response headers (seconds)
   # 等待上游响应头超时时间（秒）
   response_header_timeout: 600
@@ -546,6 +578,15 @@ gateway:
     # Max image requests waiting in this process when overflow_mode=wait, 0=unlimited
     # wait 模式当前进程允许排队等待的图片请求数，0=不限制
     max_waiting_requests: 100
+  # API Key concurrency wait queue. Global policy; no per-key database field.
+  # API Key 并发等待队列（全局策略，无逐 Key 数据库字段；进程启动时读取）。
+  api_key_queue:
+    # Extra waiting requests per API key with concurrency_limit>0; 0 disables key queueing.
+    # 每个受限 Key 允许额外等待的请求数；0 关闭 Key 排队（仍保留并发上限）。
+    max_waiting: 5
+    # Max wait budget per request in seconds (positive integer; 0 is rejected).
+    # 单个请求等待 Key 容量的最长秒数（正整数，0 会被拒绝）。
+    timeout_seconds: 30
   # SSE max line size in bytes (default: 40MB)
   # SSE 单行最大字节数（默认 40MB）
   max_line_size: 41943040
@@ -595,6 +636,9 @@ gateway:
     db_fallback_timeout_seconds: 0
     # 受控回源限流（实例级 QPS），0 表示不限制
     db_fallback_max_qps: 0
+    # OpenAI 发送前账户快照的进程内缓存 TTL（秒）；0 表示关闭。
+    # 启用后账户停用、换组或代理变更最坏可延迟该时长生效。
+    openai_turn_admission_cache_ttl_seconds: 0
     # outbox 轮询周期（秒）
     outbox_poll_interval_seconds: 1
     # outbox 滞后告警阈值（秒）
@@ -744,6 +788,19 @@ api_key_auth_cache:
     # Maximum tracked client identities per process; memory remains bounded.
     # 每进程最多跟踪的客户端身份数量，确保内存有界。
     capacity: 16384
+
+# =============================================================================
+# API Key Creation Limits
+# 用户创建 API Key 的防滥用限制（0 表示不限制）
+# =============================================================================
+api_key_create:
+  # Maximum non-deleted API keys per user
+  # 单个用户同时存在（未删除）的 API Key 上限
+  max_active_per_user: 200
+  # Maximum API key creations per user per hour (custom and generated keys).
+  # Deleting a key does not refund the count, which blocks delete/recreate loops.
+  # 单个用户每小时可创建的 API Key 次数（自定义与自动生成均计入）；删除 Key 不返还次数，阻断删建循环
+  max_per_user_per_hour: 60
 
 # =============================================================================
 # Dashboard Cache Configuration

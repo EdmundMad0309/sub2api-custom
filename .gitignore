@@ -134,10 +134,12 @@ deploy/docker-compose.override.yml
 vite.config.js
 docs/*
 !docs/openai-ws-sse-acceleration.md
+!docs/openai-outbound-identity.md
 !docs/PAYMENT.md
 !docs/PAYMENT_CN.md
 !docs/ADMIN_PAYMENT_INTEGRATION_API.md
 !docs/ASYNC_IMAGE_TASKS.md
+!docs/PRISM_BRIDGE_RESEARCH_CN.md
 !docs/BATCH_IMAGE_MVP.md
 !docs/COMPOSITE_GROUPS.md
 !docs/PLUGIN_DEVELOPMENT.md
@@ -181,3 +183,14 @@ issues/
 **/.credential-key-*
 !docs/credential-encryption.md
 !docs/screenshots/credential-encryption/
+!docs/screenshots/pelican-showcase-api-ui/
+!docs/screenshots/smart-ops-capture-harvest/
+
+!docs/typesafe-jev.md
+
+# Upstream regional egress guide
+!/docs/upstream-regional-routing.md
+
+!docs/harvest-gateway-borrow.md
+!docs/screenshots/harvest-gateway-borrow/
+!docs/screenshots/channel-monitor-v3/
